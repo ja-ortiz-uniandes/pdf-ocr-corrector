@@ -16,7 +16,7 @@ const el = {
   zoomval: $('zoomval'), fitw: $('fitw'),
   wholepage: $('wholepage'), save: $('save'),
   lang: $('lang'), psm: $('psm'), ocrdpi: $('ocrdpi'),
-  binarize: $('binarize'), invert: $('invert'),
+  binarize: $('binarize'), invert: $('invert'), replace: $('replace'),
   tessinfo: $('tessinfo'), boxlist: $('boxlist'), status: $('status'),
 };
 
@@ -260,6 +260,8 @@ function addBox(rect, psmOverride) {
     busy: true,
     preview: null,
     existing: '',
+    existingVisible: false,
+    replace: el.replace.checked,   // per box, seeded from the global setting
     err: null,
   };
   state.boxes.push(box);
@@ -293,6 +295,7 @@ async function runOcr(box, psmOverride) {
     box.text = out.text || '';
     box.preview = out.preview;
     box.existing = out.existing_text || '';
+    box.existingVisible = !!out.existing_visible;
     status(box.text ? `region #${indexOf(box)} read` : `region #${indexOf(box)}: nothing found`);
   } catch (err) {
     box.err = err.message;
@@ -448,11 +451,26 @@ function renderList() {
       note.textContent = 'OCR error: ' + b.err;
       card.appendChild(note);
     } else if (b.existing) {
-      const note = document.createElement('div');
-      note.className = 'note';
-      note.textContent = 'Note: this area already has text: '
-        + b.existing.replace(/\s+/g, ' ').slice(0, 90);
-      card.appendChild(note);
+      const wrap = document.createElement('div');
+      wrap.className = 'note' + (b.existingVisible ? ' warn' : '');
+
+      const chk = document.createElement('label');
+      chk.className = 'note-check';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = b.replace;
+      cb.addEventListener('change', () => { b.replace = cb.checked; state.saved = false; });
+      chk.append(cb, document.createTextNode(' Delete the existing text here'));
+      wrap.appendChild(chk);
+
+      const detail = document.createElement('div');
+      detail.textContent = b.existingVisible
+        ? 'Careful: the text here is VISIBLE on the page, so deleting it removes '
+          + 'words the reader can see: ' + b.existing.replace(/\s+/g, ' ').slice(0, 80)
+        : 'This area has an invisible text layer (wrong OCR). Deleting it changes '
+          + 'nothing visually: ' + b.existing.replace(/\s+/g, ' ').slice(0, 80);
+      wrap.appendChild(detail);
+      card.appendChild(wrap);
     }
 
     card.addEventListener('pointerdown', (e) => {
@@ -475,7 +493,7 @@ function renderList() {
 el.save.addEventListener('click', async () => {
   const boxes = state.boxes
     .filter((b) => b.text.trim())
-    .map((b) => ({ page: b.page, rect: b.rect, text: b.text }));
+    .map((b) => ({ page: b.page, rect: b.rect, text: b.text, replace: b.replace }));
 
   if (!boxes.length) {
     banner('Nothing to save - every region is empty.', 'err');
@@ -488,10 +506,20 @@ el.save.addEventListener('click', async () => {
     const out = await api('/api/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ doc_id: state.doc.doc_id, boxes }),
+      body: JSON.stringify({
+        doc_id: state.doc.doc_id,
+        boxes,
+        replace_existing: el.replace.checked,
+      }),
     });
     state.saved = true;
     let msg = `Saved ${out.boxes_applied} region(s), ${out.lines_written} line(s) of invisible text.`;
+    if (out.chars_removed) {
+      msg += ` Removed ${out.chars_removed} character(s) of old text`;
+      msg += out.visible_text_removed
+        ? ' (some of it was VISIBLE on the page - check the result).'
+        : ' (all of it invisible, so the page looks unchanged).';
+    }
     if (empty) msg += ` ${empty} empty region(s) skipped.`;
     if (out.unsupported_chars.length) {
       msg += ` Characters not supported by the font were replaced with "?": ${out.unsupported_chars.join(' ')}`;

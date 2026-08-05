@@ -41,6 +41,12 @@ FONT_NAME = "helv"
 # selectable, searchable and copyable.
 INVISIBLE = 3
 
+# Redaction flags for clearing a region's old text while leaving the scan
+# itself alone: drop text objects, keep images and vector art untouched.
+KEEP_IMAGES = fitz.PDF_REDACT_IMAGE_NONE
+KEEP_GRAPHICS = fitz.PDF_REDACT_LINE_ART_NONE
+DROP_TEXT = fitz.PDF_REDACT_TEXT_REMOVE
+
 MAX_RENDER_PIXELS = 40_000_000  # guard against absurd zoom levels
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
@@ -146,6 +152,64 @@ def _rect_from_norm(page: fitz.Page, norm: dict) -> fitz.Rect:
     if rect.width < 1 or rect.height < 1:
         abort(400, "selection too small")
     return rect
+
+
+def _text_rect(page: fitz.Page, view_rect: fitz.Rect) -> fitz.Rect:
+    """
+    Convert a rect in *view* space into the space PyMuPDF's text APIs use.
+
+    Two coordinate systems are in play and they differ on rotated pages:
+
+      * view space   - what `page.rect` reports and what `get_pixmap()` renders,
+                       i.e. exactly what the browser shows and the user draws on.
+      * unrotated    - what `insert_text()`, `get_text()`, `search_for()`,
+                       `get_texttrace()` and redaction annotations all operate in.
+                       These are rotation-independent: /Rotate does not move them.
+
+    For /Rotate 0 the two coincide, which is why the difference is easy to miss.
+    For 90/180/270 the page's width and height swap and text written with a view
+    rect lands in the wrong place. test_app.py anchors this against the position
+    of the sample's grey block in the *rendered pixels*.
+    """
+    if not page.rotation:
+        return view_rect
+    return (view_rect * page.derotation_matrix).normalize()
+
+
+def _region_text(page: fitz.Page, text_rect: fitz.Rect) -> tuple[str, bool]:
+    """
+    Return the text already inside `text_rect` and whether any of it is *visible*.
+
+    `text_rect` must already be in unrotated space (see `_text_rect`).
+
+    The visibility distinction decides whether clearing the region is safe: a
+    scanned page's bad OCR layer is drawn in render mode 3, so removing it changes
+    nothing on screen, while removing visible text erases words the reader can see.
+    """
+    text = page.get_text("text", clip=text_rect).strip()
+    if not text:
+        return "", False
+
+    for span in page.get_texttrace():
+        if span["type"] == INVISIBLE:
+            continue
+        if fitz.Rect(span["bbox"]).intersects(text_rect):
+            return text, True
+    return text, False
+
+
+def _clear_region_text(page: fitz.Page, rects: list[fitz.Rect]) -> None:
+    """
+    Delete every text object intersecting `rects` (unrotated space), leaving
+    pixels untouched.
+
+    fill=False matters: add_redact_annot defaults to fill=(1, 1, 1), which would
+    paint a white rectangle over the scan. Removal is per glyph, not per line, so
+    a box covering half a word leaves the other half behind.
+    """
+    for rect in rects:
+        page.add_redact_annot(rect, fill=False)
+    page.apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)
 
 
 def _clamp_zoom(rect: fitz.Rect, zoom: float) -> float:
@@ -391,9 +455,10 @@ def ocr():
         page = doc[page_no]
         rect = _rect_from_norm(page, data.get("rect") or {})
         zoom = _clamp_zoom(rect, ocr_dpi / 72.0)
+        # get_pixmap() clips in view space - the same space the browser drew in.
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
         raw = Image.open(io.BytesIO(pix.tobytes("png")))
-        existing = page.get_text("text", clip=rect).strip()
+        existing, existing_visible = _region_text(page, _text_rect(page, rect))
     finally:
         doc.close()
 
@@ -415,6 +480,7 @@ def ocr():
     return jsonify({
         "text": text,
         "existing_text": existing,
+        "existing_visible": existing_visible,
         "crop_size": [prepped.width, prepped.height],
         "preview": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
     })
@@ -435,11 +501,19 @@ def save():
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"{stem}_ocr-fixed.pdf"
 
+    default_replace = bool(data.get("replace_existing", True))
+
     doc = fitz.open(_original_pdf(doc_id))
     applied = 0
     lines_written = 0
+    chars_removed = 0
+    visible_removed = False
     dropped_chars: set[str] = set()
     try:
+        # Group by page so each page's redactions can be applied in one pass
+        # before any new text is written: apply_redactions() would otherwise
+        # strip the very text just inserted.
+        by_page: dict[int, list[tuple[fitz.Rect, str, bool]]] = {}
         for box in boxes:
             text = (box.get("text") or "").strip()
             if not text:
@@ -448,18 +522,35 @@ def save():
             if not 0 <= page_no < doc.page_count:
                 continue
             page = doc[page_no]
-            # page.rect and insert_text both work in the rotated ("view")
-            # coordinate system that the browser sees, so /Rotate 90/180/270
-            # pages need no extra compensation. test_app.py pins this.
-            rect = _rect_from_norm(page, box.get("rect") or {})
+            # The browser draws on the rendered (view) image; every text
+            # operation below needs unrotated coordinates instead.
+            rect = _text_rect(page, _rect_from_norm(page, box.get("rect") or {}))
+            replace = bool(box.get("replace", default_replace))
+            by_page.setdefault(page_no, []).append((rect, text, replace))
 
-            clean, dropped = _sanitize(text)
-            dropped_chars.update(dropped)
-            lines_written += _insert_invisible_text(page, rect, clean)
-            applied += 1
-
-        if not applied:
+        if not by_page:
             abort(400, "every box was empty")
+
+        for page_no, items in sorted(by_page.items()):
+            page = doc[page_no]
+
+            to_clear = []
+            for rect, _, replace in items:
+                if not replace:
+                    continue
+                old, was_visible = _region_text(page, rect)
+                chars_removed += len(old)
+                visible_removed = visible_removed or was_visible
+                to_clear.append(rect)
+            if to_clear:
+                _clear_region_text(page, to_clear)
+
+            for rect, text, _ in items:
+                clean, dropped = _sanitize(text)
+                dropped_chars.update(dropped)
+                lines_written += _insert_invisible_text(page, rect, clean)
+                applied += 1
+
         doc.save(str(out_path), garbage=3, deflate=True)
     finally:
         doc.close()
@@ -472,6 +563,8 @@ def save():
     return jsonify({
         "boxes_applied": applied,
         "lines_written": lines_written,
+        "chars_removed": chars_removed,
+        "visible_text_removed": visible_removed,
         "unsupported_chars": sorted(dropped_chars),
         "output_name": out_path.name,
         "output_path": str(out_path),

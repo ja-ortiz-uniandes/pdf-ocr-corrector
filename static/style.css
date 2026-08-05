@@ -254,8 +254,20 @@ main { flex: 1; display: flex; min-height: 0; }
   font: 13px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 .card textarea:focus { outline: none; border-color: var(--accent); }
-.card .note { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.card .note { font-size: 11px; color: var(--muted); margin-top: 5px; }
 .card .note.warn { color: var(--warn); }
+.card .note-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 2px;
+  cursor: pointer;
+}
+.card .note.warn .note-check { color: var(--warn); font-weight: 600; }
+
+.side-head label.check.wide { flex: 1 1 auto; padding-bottom: 0; }
 
 .side-foot {
   padding: 7px 12px;
