@@ -254,8 +254,10 @@ function addFromHidden(span) {
   drawBoxes();
   drawHidden();
   renderList();
-  focusBox(box.id);
-  status('loaded existing hidden text - edit it, or use "Delete only"');
+  // Deliberately not focusing the text field: with focus outside it, Delete stays
+  // free as "drop this text", which is the fast path when clearing a bad layer.
+  // Click into the field when you actually want to correct the wording.
+  status('picked up hidden text - press Delete to drop it, or click the field to edit');
 }
 
 el.prev.addEventListener('click', () => showPage(state.page - 1));
@@ -454,6 +456,18 @@ function focusBox(id) {
   if (ta) ta.focus();
 }
 
+/* Mark a region as "delete the old text, write nothing". The text is kept in the
+   field, struck through, so the decision stays reversible via "Keep text". */
+function markDeleteOnly(id) {
+  const box = state.boxes.find((b) => b.id === id);
+  if (!box || box.deleteOnly) return;
+  box.deleteOnly = true;
+  box.replace = true;
+  state.saved = false;
+  renderList();
+  status(`region #${indexOf(box)} will be deleted, nothing written`);
+}
+
 function removeBox(id) {
   const i = state.boxes.findIndex((b) => b.id === id);
   if (i < 0) return;
@@ -541,7 +555,7 @@ function renderList() {
     only.textContent = b.deleteOnly ? 'Keep text' : 'Delete only';
     only.title = b.deleteOnly
       ? 'Go back to writing text here'
-      : 'Just remove the old text in this area and write nothing';
+      : 'Just remove the old text in this area and write nothing (shortcut: Delete)';
     only.addEventListener('click', () => {
       b.deleteOnly = !b.deleteOnly;
       b.replace = b.replace || b.deleteOnly;
@@ -552,7 +566,7 @@ function renderList() {
     const del = document.createElement('button');
     del.className = 'del';
     del.textContent = 'Discard';
-    del.title = 'Forget this region (changes nothing in the PDF)';
+    del.title = 'Forget this region, changes nothing in the PDF (shortcut: Shift+Delete)';
     del.addEventListener('click', () => removeBox(b.id));
 
     head.append(goto, redo, only, del);
@@ -709,7 +723,12 @@ document.addEventListener('keydown', (e) => {
   if (!state.doc) return;
 
   if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selected != null) { removeBox(state.selected); e.preventDefault(); }
+    if (state.selected == null) return;
+    // Delete marks the region's text for deletion - the common case when clearing
+    // a bad OCR layer. Shift+Delete throws the region away instead.
+    if (e.shiftKey) removeBox(state.selected);
+    else markDeleteOnly(state.selected);
+    e.preventDefault();
   } else if (e.key === 'Escape') {
     select(null);
   } else if (e.key === 'PageDown' || e.key === 'ArrowRight') {
