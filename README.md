@@ -103,16 +103,22 @@ To stop the app: press `Ctrl+C` in the console window, or just close it.
 1. **Open PDF…** in the top bar, or drag a PDF onto the page.
 2. Navigate pages with `‹` `›`, the page number field, or the arrow keys.
    Zoom with `−` `+` / **Fit**.
-3. **Drag a box** over an area with missing or wrong text. It can be a single
+3. Existing hidden OCR text is **outlined faintly in purple**. Click an outline to
+   pick that text up: the panel opens with its current text prefilled, so fixing a
+   misread word is just editing it — no OCR needed. **Delete only** on the card
+   drops the text without writing anything. Toggle the outlines with **Hidden
+   text** in the toolbar.
+4. Or **drag a box** over an area with missing or wrong text. It can be a single
    word, one line, a paragraph, or — via the **Whole page** button — the entire
-   page.
-4. OCR runs on that crop only and the reading appears in the right-hand panel,
-   together with a preview of exactly what was sent to Tesseract.
-5. **Edit the text** in the box until it is correct. That edited text is what
+   page. Dragging works even when you start on top of an outline; a click picks
+   the outline up, a drag draws a new box.
+5. For a drawn box, OCR runs on that crop only and the reading appears in the
+   right-hand panel, together with a preview of exactly what was sent to Tesseract.
+6. **Edit the text** in the box until it is correct. That edited text is what
    gets embedded — Tesseract's guess is only a starting point.
-6. Repeat for as many regions and pages as you need. `Delete` removes the
-   selected box; **Re-OCR** re-runs a box after you change the settings.
-7. Click **Save PDF**. The corrected file downloads as
+7. Repeat for as many regions and pages as you need. `Delete` discards the
+   selected region; **Re-OCR** re-runs a box after you change the settings.
+8. Click **Save PDF**. The corrected file downloads as
    `<original-name>_ocr-fixed.pdf` (also kept in
    `work/<id>/output/`).
 
@@ -163,6 +169,24 @@ Three details worth knowing:
   deletion. If anything visible changed, the deletion is thrown away, the page is
   restored exactly as it was, and the banner says so — your correction is still
   added. So "the page cannot lose visible words" is enforced, not just intended.
+
+### Working straight from the outlines
+
+The purple outlines are the OCR layer itself, so they are the most precise way to
+work: no guessing where the hidden text sits, and no coverage threshold to worry
+about, because clicking one selects exactly that object.
+
+- **Fix a misread word** — click its outline, correct the prefilled text, save.
+  Nothing is re-OCR'd, so nothing new can go wrong.
+- **Drop junk text** — click the outline, hit **Delete only**, save. The region
+  writes nothing and just removes that object.
+- **Re-OCR instead** — click the outline, then **Re-OCR** on the card if you would
+  rather have Tesseract read that area afresh.
+
+Outlines already claimed by a region turn grey, so it is obvious what is queued.
+An outline is only drawn for text the app can locate; clip-mode text cannot be
+located, and the status line reports how many characters are in that state so you
+know to draw a box over them by hand.
 
 ### If deleting the old text seems to do nothing
 
@@ -256,7 +280,7 @@ unfindable, and confirm the page still looks unchanged.
 .venv/bin/python -m unittest test_app
 ```
 
-46 tests covering the parts that can fail silently: text lands inside the box you
+56 tests covering the parts that can fail silently: text lands inside the box you
 drew, it is written in invisible render mode, the rendered page stays
 byte-identical to the original, the source file is never modified, deleting a
 hidden OCR layer removes it without changing a pixel, a partly covered hidden line
@@ -280,8 +304,10 @@ npm test
 
 It drives the real `static/app.js` in jsdom with a stubbed backend and checks
 that the editable text field stays focused while you type, that a region
-finishing OCR does not steal the caret from another, and that Save sends your
-edits rather than Tesseract's guess.
+finishing OCR does not steal the caret from another, that clicking a hidden-text
+outline picks that text up without running OCR while a drag starting on the same
+outline still draws a box, and that Save sends your edits rather than Tesseract's
+guess.
 
 ---
 

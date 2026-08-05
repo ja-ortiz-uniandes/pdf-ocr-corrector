@@ -151,6 +151,30 @@ run when deletion appears to do nothing on a real file.
 `get_text(clip=...)`. `/api/ocr` surfaces both so the UI can say "this hidden text will go" and "this
 visible text is kept" independently.
 
+### Hidden-text outlines (`GET /api/hidden/<doc_id>/<page>`)
+
+The OCR layer is invisible, so the UI outlines it and lets the user click an object instead of guessing
+where it sits. The endpoint returns each hidden span's text plus its rect **normalised in view space** —
+`(bbox * page.rotation_matrix)` then divided by `page.rect` — which is the inverse of `_text_rect()` and is
+what makes a click map straight back to a selection on rotated pages.
+
+Clicking an outline creates a region prefilled with that text, `replace` forced on, and **no OCR call** —
+correcting a misread word should not risk a fresh misread. `sourceText` links the region to the span so
+re-clicking selects instead of duplicating, and claimed outlines render `.used`.
+
+Clip-only (mode 7) text cannot be outlined at all, so the response also carries `untraceable_chars`; the UI
+reports it rather than implying the page is clean.
+
+Drag-versus-tap on an outline is resolved in `pointerup`: a movement under 6px picks the outline up, larger
+means the user was drawing a box that happened to start there. Outlines sit at `z-index: 1` under the user's
+own boxes so they never steal a click.
+
+### Delete-only regions
+
+A box may carry `delete_only: true` with empty text, which clears the old text and writes nothing (`replace`
+is forced on). Empty text *without* that flag is still ignored — otherwise an OCR pass that returned nothing
+would silently delete the existing layer. Reported separately as `boxes_deleted_only`.
+
 ### Invisible text insertion (`POST /api/save`)
 
 - `render_mode=3` (`INVISIBLE`) — neither fill nor stroke, so glyphs are selectable and searchable but
