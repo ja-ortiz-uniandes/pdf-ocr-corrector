@@ -92,21 +92,33 @@ Tesseract is located by `TESSERACT_CMD`, then `PATH`, then known Windows/macOS/L
 it works on Windows even when not on PATH. Absence degrades to HTTP 503 with an actionable message, and
 `_tesseract_info()` feeds the UI banner and language dropdown.
 
-### Clearing old text (`replace`)
+### Clearing old text (`replace`) — invisible glyphs only
 
-Boxes carry a `replace` flag (default on, `replace_existing` sets the request-wide default). When set, the
-region's existing text objects are deleted before the new ones are written, so wrong or partial OCR text
-cannot survive alongside the correction.
+**Hard invariant: visible text is never deleted.** Only render-mode-3 glyphs are removable. A whole-page
+box must still leave every drawn word intact (`test_whole_page_box_keeps_all_visible_text`). This is a
+structural guarantee, not a warning the user can override — there is no flag that deletes visible text.
 
-- `_clear_region_text()` uses `add_redact_annot(rect, fill=False)` + `apply_redactions(images=KEEP_IMAGES,
-  graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is essential** — the default `fill=(1, 1, 1)`
-  paints a white rectangle over the scan.
+Boxes carry a `replace` flag (default on; `replace_existing` sets the request-wide default) controlling
+whether the hidden layer goes.
+
+The awkward part: `apply_redactions()` has **no render-mode filter** — it deletes every glyph meeting the
+rectangle. Passing the user's box straight in would therefore delete visible text too. So:
+
+- `_visible_boxes()` collects the bbox of every ink-painting glyph on the page.
+- `_invisible_runs()` walks `get_texttrace()`, keeps mode-3 spans intersecting the region, and merges
+  adjacent in-region glyph boxes into runs. Each run is checked against the visible boxes; on a collision
+  it degrades to per-glyph boxes, and any single glyph that still collides is left alone and counted as
+  `glyphs_protected`. Boxes are inset 0.3pt so merely *touching* a neighbouring glyph does not drag it in.
+- `_clear_invisible_text()` then redacts those rects with `add_redact_annot(rect, fill=False)` +
+  `apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is
+  essential** — the default `fill=(1, 1, 1)` paints a white rectangle over the scan.
 - Boxes are grouped by page and all redactions for a page are applied **before** any text is inserted;
   reversing that order makes `apply_redactions()` strip the text just written.
-- Removal is per glyph, not per line: a box covering half a word leaves the rest behind.
-- `_region_text()` reports whether the existing text is *visible* (`get_texttrace()` span `type` != 3).
-  Deleting an invisible OCR layer is pixel-for-pixel safe; deleting visible text erases words from the
-  page, so that case is surfaced in the UI and in the save response as `visible_text_removed`.
+- Deletion is per glyph, not per line: a box covering half a hidden word leaves the rest behind.
+
+`_region_text()` returns `(visible_text, invisible_text)` for a region, filtered per glyph rather than via
+`get_text(clip=...)`. `/api/ocr` surfaces both so the UI can say "this hidden text will go" and "this
+visible text is kept" independently.
 
 ### Invisible text insertion (`POST /api/save`)
 

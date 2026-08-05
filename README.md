@@ -9,9 +9,10 @@ Tesseract still got wrong. When you save, the app writes an **invisible text
 layer** at those exact coordinates on top of the existing page: the page looks
 pixel-for-pixel identical, but the text is now selectable and searchable.
 
-Any wrong or partial text already inside the box is **deleted first**, so the
-region ends up with exactly the text you approved and nothing else. For a scanned
-page that costs nothing visually, because the bad OCR layer was invisible anyway.
+Wrong or partial **hidden OCR text** inside the box is deleted first, so the
+region ends up with exactly the text you approved and nothing else. **Visible text
+is never deleted** — only the invisible layer a scanner's OCR pass left behind, so
+the page cannot lose a word you can see.
 
 The original PDF is never modified — you always get a new file.
 
@@ -124,28 +125,38 @@ To stop the app: press `Ctrl+C` in the console window, or just close it.
 | **OCR DPI** | Resolution the crop is re-rendered at before OCR. 400 suits most scans; 600–900 helps tiny print but is slower. |
 | **B/W** | Otsu black-and-white threshold. Helps faded or uneven scans, hurts anti-aliased text. |
 | **Invert** | For light text on a dark background. |
-| **Replace text already in the box** | On by default. Deletes whatever text is already inside the box before writing yours, so wrong or partial OCR text does not survive next to the correction. Turn it off to *add* your text and keep the old text as well. |
+| **Delete old OCR text in the box** | On by default. Deletes the *hidden* OCR text inside the box before writing yours, so wrong or partial text does not survive next to the correction. Visible text is never deleted, whatever this is set to. Turn it off to keep the old hidden text as well. |
 
-### Replacing wrong text vs adding text
+### What "delete the old text" does and does not touch
 
-When a region already contains text, the panel says so and offers a per-region
-**Delete the existing text here** checkbox (seeded from the global setting), so
-you can decide box by box.
+A PDF text object carries a render mode that decides whether it paints ink:
 
-Which message you get matters:
+- **Hidden text** (render mode 3) — what a scanner's OCR pass writes over the page
+  image. You never see it; it exists so the scan can be searched. When the OCR was
+  wrong, this is the text you want gone.
+- **Visible text** — real, drawn words: a born-digital PDF, or a caption. This *is*
+  the page.
 
-- *"This area has an invisible text layer (wrong OCR)"* — the normal case for a
-  scanned page. Deleting it is completely safe: invisible text is not drawn, so
-  the page still looks pixel-for-pixel identical.
-- *"Careful: the text here is VISIBLE on the page"* — the region contains real,
-  drawn text (a born-digital PDF, or a caption you overlapped). Deleting it
-  **erases words the reader can see**. Either shrink the box or untick the
-  checkbox.
+This tool only ever deletes the hidden kind. Selecting the whole page and saving
+will not remove a single visible word — there is no setting that makes it do so.
 
-Deletion is per character, not per line: a box covering half a word leaves the
-other half in place. Draw boxes that fully cover what should go. After saving,
-the banner reports how many characters were removed and whether any of them were
-visible.
+Per region the panel shows what it found:
+
+- *"Wrong OCR text hidden here: … — invisible, so deleting it changes nothing on
+  the page"*, with a **Delete the old OCR text here** checkbox (seeded from the
+  global setting) if you want to keep it after all.
+- *"This area also has visible text, which is always kept: …"* — an FYI. If that
+  visible text is already correct, the region probably needs no correction at all,
+  since adding your text on top would just create a second copy for searches.
+
+Two details worth knowing:
+
+- Deletion is per character, not per line — a box covering half a hidden word
+  leaves the other half. Draw boxes that fully cover what should go.
+- A hidden glyph that physically overlaps visible ink cannot be removed without
+  taking the ink with it, so it is kept and counted in the save banner as
+  *"N hidden character(s) were kept because visible text overlaps them"*. Rare
+  outside watermarked or double-layered files.
 
 Regardless of these settings, every crop is upscaled if small, contrast-
 normalised and unsharp-masked before OCR.
@@ -213,14 +224,15 @@ unfindable, and confirm the page still looks unchanged.
 .venv/bin/python -m unittest test_app
 ```
 
-38 tests covering the parts that can fail silently: text lands inside the box
-you drew, it is written in invisible render mode, the rendered page stays
-byte-identical to the original, the source file is never modified, replacing an
-invisible OCR layer removes it without changing a pixel, removal of *visible*
-text is reported, boxes on `/Rotate 90/180/270` pages land where you drew them
-(checked against rendered pixels, not against another PyMuPDF call), accents
-survive and unsupported characters are reported, and the API rejects bad input.
-The OCR tests skip themselves if Tesseract is missing.
+41 tests covering the parts that can fail silently: text lands inside the box you
+drew, it is written in invisible render mode, the rendered page stays
+byte-identical to the original, the source file is never modified, deleting a
+hidden OCR layer removes it without changing a pixel, **visible text survives even
+a whole-page selection**, hidden glyphs overlapping visible ink are protected,
+boxes on `/Rotate 90/180/270` pages land where you drew them (checked against
+rendered pixels, not against another PyMuPDF call), accents survive and
+unsupported characters are reported, and the API rejects bad input. The OCR tests
+skip themselves if Tesseract is missing.
 
 There is also an **optional** frontend test suite. It needs Node.js, which the
 app itself does not:
@@ -247,8 +259,8 @@ edits rather than Tesseract's guess.
 | Dependency install failed / broken venv | Delete the `.venv` folder and run the start script again. |
 | OCR returns nothing for a box | Try a different **Layout** mode, raise **OCR DPI**, or tick **B/W**. Very small boxes read better as *Single word* / *Single line*. |
 | Text embedded but selection sits too high or low | Redraw the box to hug the text block more tightly; the layer is fitted to the box, not to the ink. |
-| Old wrong text still there after saving | The region's **Delete the existing text here** box was unticked, or your box did not fully cover the old text (removal is per character). Redraw it a little larger. |
-| Words disappeared from the page | You replaced a region containing *visible* text, which the panel warns about. The original file is untouched — reload it and either shrink the box or untick the replace checkbox. |
+| Old wrong text still there after saving | The region's **Delete the old OCR text here** box was unticked, or your box did not fully cover it (deletion is per character). Redraw it a little larger. |
+| Old text still there and the banner mentions protected characters | Those hidden glyphs overlap visible ink, so removing them would have erased visible words. Nothing to fix — the visible text is authoritative there. |
 | Browser did not open | Open the URL printed in the console manually. Set `PDFOCR_NO_BROWSER=1` to disable auto-open. |
 | Want a different port | `PDFOCR_PORT=9000` before launching. |
 
