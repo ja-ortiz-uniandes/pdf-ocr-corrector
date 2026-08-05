@@ -16,10 +16,10 @@ from pathlib import Path
 import fitz
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from app import _is_hidden  # noqa: E402  - reuse the app's own classification
+from app import _confirm_buried, _hidden_kind, _image_rects  # noqa: E402
 
 
-def dump_modes(doc: fitz.Document, page_no: int | None) -> None:
+def dump_modes(doc: fitz.Document, page_no: int | None, source: Path) -> None:
     """
     Show each text span with its render mode and whether the app treats it as
     hidden. If a region's text does not show up here at all, it is clip-only text
@@ -29,18 +29,23 @@ def dump_modes(doc: fitz.Document, page_no: int | None) -> None:
         if page_no is not None and i != page_no:
             continue
         spans = page.get_texttrace()
+        images = _image_rects(page)
+        buried = _confirm_buried(page, source, i)
         traced = sum(len(s["chars"]) for s in spans)
         extracted = len(page.get_text("text").replace("\n", "").replace(" ", ""))
-        print(f"\n--- page {i + 1}: {len(spans)} span(s) ---")
+        print(f"\n--- page {i + 1}: {len(spans)} span(s), {len(images)} image(s) ---")
         for span in spans:
             text = "".join(chr(c[0]) for c in span["chars"]).strip()
             if not text:
                 continue
-            kind = "HIDDEN " if _is_hidden(span) else "visible"
+            kind = _hidden_kind(span)
+            if kind is None and span.get("seqno") in buried:
+                kind = "behind image"
+            label = f"HIDDEN[{kind}]" if kind else "visible"
             box = tuple(round(v) for v in span["bbox"])
-            print(f"  {kind} mode={span['type']} opacity={span['opacity']} "
-                  f"colour={span['color']} bbox={box}")
-            print(f"          {text[:88]}")
+            print(f"  {label:<22} mode={span['type']} opacity={span['opacity']} "
+                  f"colour={span['color']} seqno={span.get('seqno')} bbox={box}")
+            print(f"      {text[:88]}")
         if extracted > traced + 5:
             print(f"  NOTE: {extracted} characters extract from this page but only "
                   f"{traced} are traceable.")
@@ -68,7 +73,7 @@ def main() -> int:
     doc = fitz.open(args.pdf)
 
     if args.modes:
-        dump_modes(doc, args.page - 1 if args.page else None)
+        dump_modes(doc, args.page - 1 if args.page else None, args.pdf)
         doc.close()
         return 0
     hits = []

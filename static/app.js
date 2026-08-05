@@ -139,7 +139,8 @@ async function loadPdf(file) {
     el.dropzone.hidden = true;
     el.pagewrap.hidden = false;
     el.pagenav.hidden = el.zoomgrp.hidden = false;
-    el.wholepage.hidden = el.save.hidden = el.hiddenlbl.hidden = false;
+    el.wholepage.hidden = el.save.hidden = false;
+    if (el.hiddenlbl) el.hiddenlbl.hidden = false;
 
     showPage(0);
     fitWidth();
@@ -193,7 +194,9 @@ async function loadHidden(pageNo) {
 
 function drawHidden() {
   el.overlay.querySelectorAll('.hx').forEach((n) => n.remove());
-  if (!el.showhidden.checked) return;
+  // Guard against a stale cached index.html lacking the toggle: better to lose
+  // the outlines than to throw and take the whole script down.
+  if (!el.showhidden || !el.showhidden.checked) return;
 
   state.hidden.forEach((span, i) => {
     const d = document.createElement('div');
@@ -208,12 +211,19 @@ function drawHidden() {
       width: (span.rect.x1 - span.rect.x0) * 100 + '%',
       height: (span.rect.y1 - span.rect.y0) * 100 + '%',
     });
-    d.title = 'Hidden text: ' + trim(span.text, 120) + '\nClick to fix or delete it.';
+    const why = {
+      invisible: 'invisible text layer',
+      transparent: 'fully transparent text',
+      white: 'white-on-white text',
+      'behind image': 'text painted behind the scan image',
+    }[span.kind] || 'hidden text';
+    d.title = `Hidden text (${why}): ${trim(span.text, 120)}`
+      + '\nClick to load it for correction, or to delete it.';
     el.overlay.appendChild(d);
   });
 }
 
-el.showhidden.addEventListener('change', drawHidden);
+if (el.showhidden) el.showhidden.addEventListener('change', drawHidden);
 
 function addFromHidden(span) {
   // Already queued? Just select it instead of stacking duplicates.

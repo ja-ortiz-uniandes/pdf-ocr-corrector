@@ -186,30 +186,140 @@ def _text_rect(page: fitz.Page, view_rect: fitz.Rect) -> fitz.Rect:
     return (view_rect * page.derotation_matrix).normalize()
 
 
-def _is_hidden(span: dict) -> bool:
-    """
-    Whether a text span paints no ink, i.e. it is an OCR layer rather than content.
+def _image_rects(page: fitz.Page) -> list[fitz.Rect]:
+    """Where each raster image sits, used to spot text that may be buried."""
+    out: list[fitz.Rect] = []
+    try:
+        infos = page.get_image_info()
+    except Exception:      # pragma: no cover - malformed page resources
+        return out
+    for info in infos:
+        rect = fitz.Rect(info.get("bbox") or (0, 0, 0, 0))
+        if not rect.is_empty:
+            out.append(rect)
+    return out
 
-    Three shapes turn up in real files:
+
+def _hidden_kind(span: dict) -> str | None:
+    """
+    Why a span paints no ink by itself, or None if it might be real content.
+
+    Three shapes are decidable from the span alone:
       * render mode 3 - the standard invisible OCR layer (`type` 3 here)
       * zero opacity  - same intent, different mechanism
       * white fill    - what older OCR tools used before mode 3 caught on
 
+    A fourth shape is *not* decidable here: ordinary black text painted before the
+    scan image, which the picture then covers completely. Draw order cannot be read
+    reliably off `get_texttrace()["seqno"]` versus `get_image_info()["number"]` -
+    they are different sequences - so burial is settled by experiment instead, in
+    `_burial_confirmed()`.
+
     Clip-only text (render mode 7) paints nothing either, but `get_texttrace()`
-    does not report it at all, so it cannot be classified here - see
-    `_clearable_rects`, which falls back to the selection rectangle to catch it.
+    does not report it at all - see `_clearable_rects`, which falls back to the
+    selection rectangle to catch it.
     """
     if span["type"] == INVISIBLE:
-        return True
+        return "invisible"
     if span.get("opacity") == 0:
-        return True
+        return "transparent"
     color = span.get("color")
     if span["type"] == 0 and color and len(color) == 3 and min(color) >= 0.99:
-        return True
-    return False
+        return "white"
+    return None
 
 
-def _region_text(page: fitz.Page, text_rect: fitz.Rect) -> tuple[str, str]:
+def _is_hidden(span: dict) -> bool:
+    """Whether a span is provably an OCR layer rather than visible content."""
+    return _hidden_kind(span) is not None
+
+
+def _buried_candidates(page: fitz.Page) -> list[dict]:
+    """
+    Spans that look like content but sit entirely inside a raster image.
+
+    Either the image covers them - a buried OCR layer - or they were painted on
+    top of it and are perfectly visible. `_burial_confirmed()` decides which.
+    """
+    images = _image_rects(page)
+    if not images:
+        return []
+    out = []
+    for span in page.get_texttrace():
+        if _is_hidden(span):
+            continue
+        box = fitz.Rect(span["bbox"])
+        if box.is_empty or box.get_area() <= 0:
+            continue
+        if any((box & img).get_area() / box.get_area() >= 0.9 for img in images):
+            out.append(span)
+    return out
+
+
+def _burial_confirmed(source: Path, page_no: int, rects: list[fitz.Rect]) -> bool:
+    """
+    Decide by experiment whether clearing `rects` is invisible to the reader.
+
+    Clears them on a throwaway copy of the file and compares renders of just that
+    area. True means the text really was buried under an image and can be removed
+    safely; False means it is drawn on top and must be left alone.
+    """
+    if not rects:
+        return False
+    clip = fitz.Rect(rects[0])
+    for rect in rects[1:]:
+        clip |= rect
+    clip += (-2, -2, 2, 2)
+    probe = fitz.open(source)
+    try:
+        page = probe[page_no]
+        zoom = VERIFY_DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        before = page.get_pixmap(matrix=matrix, clip=clip).tobytes("png")
+        _clear_invisible_text(page, rects)
+        return page.get_pixmap(matrix=matrix, clip=clip).tobytes("png") == before
+    except Exception:      # pragma: no cover - never let a probe break a save
+        return False
+    finally:
+        probe.close()
+
+
+# Cap on individual burial probes per page, so a pathological file cannot turn one
+# request into thousands of renders. Each probe only renders one span's area.
+MAX_BURIAL_PROBES = 60
+
+
+def _confirm_buried(page: fitz.Page, source: Path, page_no: int) -> set[int]:
+    """
+    Sequence numbers of spans proven to be buried under an image on this page.
+
+    Tries the whole set at once, which is the common case for a scan, and only
+    falls back to probing spans one by one when the group test fails - that means
+    the page mixes buried text with text drawn on top of the same image.
+    """
+    candidates = _buried_candidates(page)
+    if not candidates:
+        return set()
+
+    def seqno_of(span):
+        return span.get("seqno")
+
+    rects = [fitz.Rect(s["bbox"]) for s in candidates]
+    if _burial_confirmed(source, page_no, rects):
+        return {seqno_of(s) for s in candidates if seqno_of(s) is not None}
+
+    buried: set[int] = set()
+    for span in candidates[:MAX_BURIAL_PROBES]:
+        seq = seqno_of(span)
+        if seq is None:
+            continue
+        if _burial_confirmed(source, page_no, [fitz.Rect(span["bbox"])]):
+            buried.add(seq)
+    return buried
+
+
+def _region_text(page: fitz.Page, text_rect: fitz.Rect,
+                 buried: set[int] = frozenset()) -> tuple[str, str]:
     """
     Return `(visible_text, invisible_text)` found inside `text_rect`.
 
@@ -230,15 +340,16 @@ def _region_text(page: fitz.Page, text_rect: fitz.Rect) -> tuple[str, str]:
         )
         if not chars.strip():
             continue
-        (invisible if _is_hidden(span) else visible).append(chars.strip())
+        hidden = _is_hidden(span) or span.get("seqno") in buried
+        (invisible if hidden else visible).append(chars.strip())
     return " ".join(visible).strip(), " ".join(invisible).strip()
 
 
-def _visible_boxes(page: fitz.Page) -> list[fitz.Rect]:
+def _visible_boxes(page: fitz.Page, buried: set[int] = frozenset()) -> list[fitz.Rect]:
     """Bounding boxes of every glyph that actually paints ink on this page."""
     boxes: list[fitz.Rect] = []
     for span in page.get_texttrace():
-        if _is_hidden(span):
+        if _is_hidden(span) or span.get("seqno") in buried:
             continue
         for ch in span["chars"]:
             box = fitz.Rect(ch[3])
@@ -248,7 +359,8 @@ def _visible_boxes(page: fitz.Page) -> list[fitz.Rect]:
 
 
 def _clearable_rects(page: fitz.Page, text_rect: fitz.Rect,
-                     visible: list[fitz.Rect]) -> tuple[list[fitz.Rect], int]:
+                     visible: list[fitz.Rect],
+                     buried: set[int] = frozenset()) -> tuple[list[fitz.Rect], int]:
     """
     Decide what may be deleted for a selection, returning `(rects, protected)`.
 
@@ -267,7 +379,8 @@ def _clearable_rects(page: fitz.Page, text_rect: fitz.Rect,
       only hidden lines qualify, each checked against the visible glyph boxes.
       Lines that overlap ink are skipped and counted as protected.
     """
-    hidden_spans = [s for s in page.get_texttrace() if _is_hidden(s)]
+    hidden_spans = [s for s in page.get_texttrace()
+                    if _is_hidden(s) or s.get("seqno") in buried]
     rects: list[fitz.Rect] = []
     protected = 0
     ink_here = [v for v in visible if v.intersects(text_rect)]
@@ -449,8 +562,16 @@ def _insert_invisible_text(page: fitz.Page, rect: fitz.Rect, text: str) -> int:
 
 @app.after_request
 def _no_cache(resp):
-    if request.path.startswith("/api/") or request.path == "/":
-        resp.headers["Cache-Control"] = "no-store"
+    # /static too: a browser holding a stale app.js after an update looks exactly
+    # like a broken feature, and there is nothing to gain from caching locally.
+    # Page renders are exempt - they are large, immutable per (page, dpi), and the
+    # route sets its own caching header.
+    if request.path.startswith("/api/page/"):
+        return resp
+    if (request.path.startswith("/api/") or request.path == "/"
+            or request.path.startswith("/static/")):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
     return resp
 
 
@@ -535,17 +656,22 @@ def hidden_spans(doc_id: str, page_no: int):
     Rects come back normalised in *view* space, matching what the browser draws
     on, so a click maps straight to a selection.
     """
-    doc = fitz.open(_original_pdf(doc_id))
+    source = _original_pdf(doc_id)
+    doc = fitz.open(source)
     try:
         if not 0 <= page_no < doc.page_count:
             abort(404, "page out of range")
         page = doc[page_no]
         pr = page.rect
+        buried = _confirm_buried(page, source, page_no)
         spans = []
         traced = 0
         for span in page.get_texttrace():
             traced += len(span["chars"])
-            if not _is_hidden(span):
+            kind = _hidden_kind(span)
+            if kind is None and span.get("seqno") in buried:
+                kind = "behind image"
+            if kind is None:
                 continue
             text = "".join(chr(ch[0]) for ch in span["chars"]).strip()
             if not text:
@@ -557,6 +683,7 @@ def hidden_spans(doc_id: str, page_no: int):
             spans.append({
                 "text": text,
                 "mode": span["type"],
+                "kind": kind,
                 "rect": {
                     "x0": (view.x0 - pr.x0) / pr.width,
                     "y0": (view.y0 - pr.y0) / pr.height,
@@ -610,7 +737,9 @@ def ocr():
         # get_pixmap() clips in view space - the same space the browser drew in.
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
         raw = Image.open(io.BytesIO(pix.tobytes("png")))
-        visible_text, invisible_text = _region_text(page, _text_rect(page, rect))
+        buried = _confirm_buried(page, _original_pdf(doc_id), page_no)
+        visible_text, invisible_text = _region_text(
+            page, _text_rect(page, rect), buried)
     finally:
         doc.close()
 
@@ -695,13 +824,16 @@ def save():
             page = doc[page_no]
 
             # Only hidden text is ever deleted, and the result is checked against
-            # the page's own render before it is accepted.
-            visible = _visible_boxes(page)
+            # the page's own render before it is accepted. Text buried under an
+            # image counts as hidden once proven so by experiment.
+            buried = _confirm_buried(page, source, page_no) if any(
+                replace for _, _, replace in items) else frozenset()
+            visible = _visible_boxes(page, buried)
             to_clear: list[fitz.Rect] = []
             for rect, _, replace in items:
                 if not replace:
                     continue
-                rects, protected = _clearable_rects(page, rect, visible)
+                rects, protected = _clearable_rects(page, rect, visible, buried)
                 to_clear.extend(rects)
                 lines_protected += protected
 
