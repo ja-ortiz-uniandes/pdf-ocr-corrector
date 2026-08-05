@@ -527,6 +527,57 @@ def page_png(doc_id: str, page_no: int):
     return resp
 
 
+@app.get("/api/hidden/<doc_id>/<int:page_no>")
+def hidden_spans(doc_id: str, page_no: int):
+    """
+    List the page's hidden text objects so the UI can outline them.
+
+    Rects come back normalised in *view* space, matching what the browser draws
+    on, so a click maps straight to a selection.
+    """
+    doc = fitz.open(_original_pdf(doc_id))
+    try:
+        if not 0 <= page_no < doc.page_count:
+            abort(404, "page out of range")
+        page = doc[page_no]
+        pr = page.rect
+        spans = []
+        traced = 0
+        for span in page.get_texttrace():
+            traced += len(span["chars"])
+            if not _is_hidden(span):
+                continue
+            text = "".join(chr(ch[0]) for ch in span["chars"]).strip()
+            if not text:
+                continue
+            box = fitz.Rect(span["bbox"])
+            if box.is_empty:
+                continue
+            view = (box * page.rotation_matrix).normalize()
+            spans.append({
+                "text": text,
+                "mode": span["type"],
+                "rect": {
+                    "x0": (view.x0 - pr.x0) / pr.width,
+                    "y0": (view.y0 - pr.y0) / pr.height,
+                    "x1": (view.x1 - pr.x0) / pr.width,
+                    "y1": (view.y1 - pr.y0) / pr.height,
+                },
+            })
+
+        # Clip-only text (render mode 7) never shows up in get_texttrace(), so it
+        # cannot be outlined. Tell the UI how much text is unaccounted for, so it
+        # can say "draw a box over it instead" rather than implying there is none.
+        extracted = len("".join(page.get_text("text").split()))
+        spans.sort(key=lambda s: (round(s["rect"]["y0"], 3), s["rect"]["x0"]))
+        return jsonify({
+            "spans": spans,
+            "untraceable_chars": max(0, extracted - traced),
+        })
+    finally:
+        doc.close()
+
+
 @app.post("/api/ocr")
 def ocr():
     data = request.get_json(silent=True) or {}
@@ -608,6 +659,7 @@ def save():
     doc = fitz.open(source)
     original = fitz.open(source)   # pristine reference for the appearance guard
     applied = 0
+    cleared_only = 0
     lines_written = 0
     chars_removed = 0
     lines_protected = 0
@@ -620,7 +672,11 @@ def save():
         by_page: dict[int, list[tuple[fitz.Rect, str, bool]]] = {}
         for box in boxes:
             text = (box.get("text") or "").strip()
-            if not text:
+            # A box with no text is only meaningful when it was explicitly marked
+            # for deletion - clicking a hidden text object and choosing to drop it.
+            # Otherwise an empty OCR result would silently delete the old text.
+            delete_only = bool(box.get("delete_only"))
+            if not text and not delete_only:
                 continue
             page_no = int(box.get("page", 0))
             if not 0 <= page_no < doc.page_count:
@@ -629,7 +685,7 @@ def save():
             # The browser draws on the rendered (view) image; every text
             # operation below needs unrotated coordinates instead.
             rect = _text_rect(page, _rect_from_norm(page, box.get("rect") or {}))
-            replace = bool(box.get("replace", default_replace))
+            replace = True if delete_only else bool(box.get("replace", default_replace))
             by_page.setdefault(page_no, []).append((rect, text, replace))
 
         if not by_page:
@@ -668,6 +724,9 @@ def save():
                     chars_removed += max(0, before_text - after_text)
 
             for rect, text, _ in items:
+                if not text:
+                    cleared_only += 1      # a delete-only box: nothing to write
+                    continue
                 clean, dropped = _sanitize(text)
                 dropped_chars.update(dropped)
                 lines_written += _insert_invisible_text(page, rect, clean)
@@ -685,6 +744,7 @@ def save():
 
     return jsonify({
         "boxes_applied": applied,
+        "boxes_deleted_only": cleared_only,
         "lines_written": lines_written,
         "chars_removed": chars_removed,
         "lines_protected": lines_protected,

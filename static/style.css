@@ -75,6 +75,11 @@ body { display: flex; flex-direction: column; }
 .btn.primary { background: var(--accent2); border-color: var(--accent2); font-weight: 600; }
 .btn.primary:hover { background: var(--accent); }
 .btn.danger:hover { border-color: var(--err); color: var(--err); }
+.btn.toggle { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+.btn.toggle input { margin: 0; }
+
+.card-head .num.hidden-src { background: #b28cff; color: #1b1030; }
+.card.delonly textarea { opacity: .45; text-decoration: line-through; }
 
 .group { display: flex; align-items: center; gap: 4px; }
 .pageinfo, .zoomval { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -161,6 +166,27 @@ main { flex: 1; display: flex; min-height: 0; }
   background: rgba(79, 156, 249, .12);
   pointer-events: none;
 }
+
+/* Existing hidden text already in the PDF: faint, but unmistakably there.
+   Sits under the user's own boxes so it never steals a click from them. */
+.hx {
+  position: absolute;
+  z-index: 1;
+  border: 1px dashed rgba(150, 110, 220, .75);
+  background: rgba(150, 110, 220, .10);
+  cursor: pointer;
+}
+.hx:hover {
+  border-color: rgba(178, 140, 255, 1);
+  background: rgba(178, 140, 255, .26);
+  box-shadow: 0 0 0 1px rgba(178, 140, 255, .55);
+}
+.hx.used {
+  border-style: solid;
+  border-color: rgba(120, 120, 130, .5);
+  background: rgba(120, 120, 130, .10);
+}
+.bx { z-index: 2; }
 
 /* ---------------- sidebar ---------------- */
 

@@ -15,6 +15,7 @@ const el = {
   zoomgrp: $('zoomgrp'), zoomin: $('zoomin'), zoomout: $('zoomout'),
   zoomval: $('zoomval'), fitw: $('fitw'),
   wholepage: $('wholepage'), save: $('save'),
+  showhidden: $('showhidden'), hiddenlbl: $('hiddenlbl'),
   lang: $('lang'), psm: $('psm'), ocrdpi: $('ocrdpi'),
   binarize: $('binarize'), invert: $('invert'), replace: $('replace'),
   tessinfo: $('tessinfo'), boxlist: $('boxlist'), status: $('status'),
@@ -32,6 +33,9 @@ const state = {
   nextId: 1,
   tesseract: null,
   saved: true,
+  hidden: [],         // hidden text objects on the current page, from /api/hidden
+  hiddenPage: null,   // which page state.hidden belongs to
+  untraceable: 0,     // hidden chars that cannot be outlined (clip-mode text)
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -135,7 +139,7 @@ async function loadPdf(file) {
     el.dropzone.hidden = true;
     el.pagewrap.hidden = false;
     el.pagenav.hidden = el.zoomgrp.hidden = false;
-    el.wholepage.hidden = el.save.hidden = false;
+    el.wholepage.hidden = el.save.hidden = el.hiddenlbl.hidden = false;
 
     showPage(0);
     fitWidth();
@@ -159,6 +163,89 @@ function showPage(n) {
   el.next.disabled = n === state.doc.pages.length - 1;
   drawBoxes();
   renderList();
+  loadHidden(n);
+}
+
+/* ------------------------------------------------- existing hidden text */
+
+async function loadHidden(pageNo) {
+  state.hidden = [];
+  state.hiddenPage = pageNo;
+  drawHidden();
+  try {
+    const out = await api(`/api/hidden/${state.doc.doc_id}/${pageNo}`);
+    if (state.hiddenPage !== pageNo) return;   // user paged away meanwhile
+    state.hidden = out.spans || [];
+    state.untraceable = out.untraceable_chars || 0;
+    drawHidden();
+    if (state.hidden.length || state.untraceable) {
+      let msg = `${state.hidden.length} hidden text object(s) on this page`;
+      if (state.untraceable) {
+        msg += `; ~${state.untraceable} character(s) cannot be outlined (clip-mode`
+          + ' text) - draw a box over those by hand';
+      }
+      status(msg);
+    }
+  } catch (err) {
+    status('could not read hidden text: ' + err.message);
+  }
+}
+
+function drawHidden() {
+  el.overlay.querySelectorAll('.hx').forEach((n) => n.remove());
+  if (!el.showhidden.checked) return;
+
+  state.hidden.forEach((span, i) => {
+    const d = document.createElement('div');
+    d.className = 'hx';
+    d.dataset.hidden = i;
+    // Grey out ones already claimed by a region, so it is obvious what is queued.
+    if (state.boxes.some((b) => b.page === state.page && b.sourceText === span.text)) {
+      d.classList.add('used');
+    }
+    Object.assign(d.style, {
+      left: span.rect.x0 * 100 + '%', top: span.rect.y0 * 100 + '%',
+      width: (span.rect.x1 - span.rect.x0) * 100 + '%',
+      height: (span.rect.y1 - span.rect.y0) * 100 + '%',
+    });
+    d.title = 'Hidden text: ' + trim(span.text, 120) + '\nClick to fix or delete it.';
+    el.overlay.appendChild(d);
+  });
+}
+
+el.showhidden.addEventListener('change', drawHidden);
+
+function addFromHidden(span) {
+  // Already queued? Just select it instead of stacking duplicates.
+  const existing = state.boxes.find(
+    (b) => b.page === state.page && b.sourceText === span.text);
+  if (existing) {
+    select(existing.id);
+    return;
+  }
+  const box = {
+    id: state.nextId++,
+    page: state.page,
+    rect: span.rect,
+    text: span.text,           // prefilled: usually a typo fix, no OCR needed
+    sourceText: span.text,
+    busy: false,
+    preview: null,
+    existingInvisible: span.text,
+    existingVisible: '',
+    replace: true,             // the point is to get rid of this object
+    deleteOnly: false,
+    fromHidden: true,
+    err: null,
+  };
+  state.boxes.push(box);
+  state.saved = false;
+  state.selected = box.id;
+  drawBoxes();
+  drawHidden();
+  renderList();
+  focusBox(box.id);
+  status('loaded existing hidden text - edit it, or use "Delete only"');
 }
 
 el.prev.addEventListener('click', () => showPage(state.page - 1));
@@ -202,12 +289,16 @@ let drag = null;
 el.overlay.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !state.doc) return;
   if (e.target.closest('.bx')) return;   // clicking an existing box selects it
+  const onHidden = e.target.closest('.hx');
   const r = el.overlay.getBoundingClientRect();
   drag = {
     x0: (e.clientX - r.left) / r.width,
     y0: (e.clientY - r.top) / r.height,
     x1: (e.clientX - r.left) / r.width,
     y1: (e.clientY - r.top) / r.height,
+    // Remember the outline under the pointer: a tap picks it up, while an actual
+    // drag still means "draw a new box", even when it starts over an outline.
+    hiddenIndex: onHidden ? Number(onHidden.dataset.hidden) : null,
     ghost: document.createElement('div'),
   };
   drag.ghost.className = 'ghost';
@@ -232,12 +323,17 @@ el.overlay.addEventListener('pointerup', (e) => {
   if (!drag) return;
   const r = el.overlay.getBoundingClientRect();
   const rect = normRect(drag);
+  const hiddenIndex = drag.hiddenIndex;
   drag.ghost.remove();
   drag = null;
   el.overlay.releasePointerCapture(e.pointerId);
   // Ignore accidental clicks / hairline drags.
   if ((rect.x1 - rect.x0) * r.width < 6 || (rect.y1 - rect.y0) * r.height < 6) {
-    select(null);
+    if (hiddenIndex != null && state.hidden[hiddenIndex]) {
+      addFromHidden(state.hidden[hiddenIndex]);
+    } else {
+      select(null);
+    }
     return;
   }
   addBox(rect);
@@ -267,6 +363,9 @@ function addBox(rect, psmOverride) {
     existingInvisible: '',
     existingVisible: '',
     replace: el.replace.checked,   // per box, seeded from the global setting
+    deleteOnly: false,
+    fromHidden: false,
+    sourceText: null,
     err: null,
   };
   state.boxes.push(box);
@@ -352,6 +451,7 @@ function removeBox(id) {
   if (state.selected === id) state.selected = null;
   state.saved = state.boxes.length === 0 && state.saved;
   drawBoxes();
+  drawHidden();     // an outline may no longer be claimed
   renderList();
 }
 
@@ -403,13 +503,14 @@ function renderList() {
 
   state.boxes.forEach((b, i) => {
     const card = document.createElement('div');
-    card.className = 'card' + (b.id === state.selected ? ' sel' : '');
+    card.className = 'card' + (b.id === state.selected ? ' sel' : '')
+      + (b.deleteOnly ? ' delonly' : '');
     card.dataset.id = b.id;
 
     const head = document.createElement('div');
     head.className = 'card-head';
-    head.innerHTML = `<span class="num">${i + 1}</span>`
-      + `<span>page ${b.page + 1}</span>`
+    head.innerHTML = `<span class="num${b.fromHidden ? ' hidden-src' : ''}">${i + 1}</span>`
+      + `<span>page ${b.page + 1}${b.fromHidden ? ' · existing text' : ''}</span>`
       + `<span class="grow">${b.busy ? '<span class="spin"></span> reading…' : ''}</span>`;
 
     const goto = document.createElement('button');
@@ -426,12 +527,25 @@ function renderList() {
     redo.disabled = b.busy;
     redo.addEventListener('click', () => runOcr(b));
 
+    const only = document.createElement('button');
+    only.textContent = b.deleteOnly ? 'Keep text' : 'Delete only';
+    only.title = b.deleteOnly
+      ? 'Go back to writing text here'
+      : 'Just remove the old text in this area and write nothing';
+    only.addEventListener('click', () => {
+      b.deleteOnly = !b.deleteOnly;
+      b.replace = b.replace || b.deleteOnly;
+      state.saved = false;
+      renderList();
+    });
+
     const del = document.createElement('button');
     del.className = 'del';
-    del.textContent = 'Delete';
+    del.textContent = 'Discard';
+    del.title = 'Forget this region (changes nothing in the PDF)';
     del.addEventListener('click', () => removeBox(b.id));
 
-    head.append(goto, redo, del);
+    head.append(goto, redo, only, del);
     card.appendChild(head);
 
     if (b.preview) {
@@ -444,7 +558,10 @@ function renderList() {
 
     const ta = document.createElement('textarea');
     ta.value = b.text;
-    ta.placeholder = b.busy ? 'running OCR…' : 'text to embed at this box';
+    ta.disabled = b.deleteOnly;
+    ta.placeholder = b.busy ? 'running OCR…'
+      : (b.deleteOnly ? 'old text will be deleted, nothing written'
+        : 'text to embed at this box');
     ta.spellcheck = false;
     ta.addEventListener('input', () => { b.text = ta.value; state.saved = false; });
     ta.addEventListener('focus', () => select(b.id));
@@ -465,14 +582,17 @@ function renderList() {
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = b.replace;
+        cb.disabled = b.deleteOnly;   // deleting is the entire point of that mode
         cb.addEventListener('change', () => { b.replace = cb.checked; state.saved = false; });
         chk.append(cb, document.createTextNode(' Delete the old OCR text here'));
         wrap.appendChild(chk);
 
         const detail = document.createElement('div');
-        detail.textContent = 'Wrong OCR text hidden here: '
-          + trim(b.existingInvisible, 80)
-          + ' - invisible, so deleting it changes nothing on the page.';
+        detail.textContent = b.fromHidden
+          ? 'Loaded from the PDF: ' + trim(b.existingInvisible, 80)
+            + ' - edit it above to correct it, or use "Delete only" to drop it.'
+          : 'Wrong OCR text hidden here: ' + trim(b.existingInvisible, 80)
+            + ' - invisible, so deleting it changes nothing on the page.';
         wrap.appendChild(detail);
         card.appendChild(wrap);
       }
@@ -505,8 +625,14 @@ function renderList() {
 
 el.save.addEventListener('click', async () => {
   const boxes = state.boxes
-    .filter((b) => b.text.trim())
-    .map((b) => ({ page: b.page, rect: b.rect, text: b.text, replace: b.replace }));
+    .filter((b) => b.deleteOnly || b.text.trim())
+    .map((b) => ({
+      page: b.page,
+      rect: b.rect,
+      text: b.deleteOnly ? '' : b.text,
+      replace: b.replace,
+      delete_only: !!b.deleteOnly,
+    }));
 
   if (!boxes.length) {
     banner('Nothing to save - every region is empty.', 'err');
@@ -527,6 +653,9 @@ el.save.addEventListener('click', async () => {
     });
     state.saved = true;
     let msg = `Saved ${out.boxes_applied} region(s), ${out.lines_written} line(s) of invisible text.`;
+    if (out.boxes_deleted_only) {
+      msg += ` ${out.boxes_deleted_only} region(s) were delete-only.`;
+    }
     if (out.chars_removed) {
       msg += ` Deleted ${out.chars_removed} character(s) of old hidden text`
         + ' (the page still looks the same).';
