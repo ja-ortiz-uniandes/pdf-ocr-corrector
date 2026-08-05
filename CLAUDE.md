@@ -36,6 +36,9 @@ start.bat                    # Windows
 # Inspect / verify a PDF's text layer after a save
 .venv/Scripts/python check_pdf_text.py "work/<doc_id>/output/<name>_ocr-fixed.pdf" --find "some text"
 
+# Why did deletion not remove anything? Show render modes and hidden/visible verdicts
+.venv/Scripts/python check_pdf_text.py "some.pdf" --modes --page 1
+
 # Optional frontend tests (jsdom; the app itself needs no Node.js)
 cd tests/ui && npm install && npm test
 node ui.test.mjs ../../static/app.js     # or point at any other copy of app.js
@@ -102,19 +105,47 @@ Boxes carry a `replace` flag (default on; `replace_existing` sets the request-wi
 whether the hidden layer goes.
 
 The awkward part: `apply_redactions()` has **no render-mode filter** — it deletes every glyph meeting the
-rectangle. Passing the user's box straight in would therefore delete visible text too. So:
+rectangle. Which rectangles get handed to it *is* the safety mechanism.
 
-- `_visible_boxes()` collects the bbox of every ink-painting glyph on the page.
-- `_invisible_runs()` walks `get_texttrace()`, keeps mode-3 spans intersecting the region, and merges
-  adjacent in-region glyph boxes into runs. Each run is checked against the visible boxes; on a collision
-  it degrades to per-glyph boxes, and any single glyph that still collides is left alone and counted as
-  `glyphs_protected`. Boxes are inset 0.3pt so merely *touching* a neighbouring glyph does not drag it in.
-- `_clear_invisible_text()` then redacts those rects with `add_redact_annot(rect, fill=False)` +
-  `apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is
-  essential** — the default `fill=(1, 1, 1)` paints a white rectangle over the scan.
-- Boxes are grouped by page and all redactions for a page are applied **before** any text is inserted;
-  reversing that order makes `apply_redactions()` strip the text just written.
-- Deletion is per glyph, not per line: a box covering half a hidden word leaves the rest behind.
+`_is_hidden()` decides what counts as an OCR layer rather than content. Real files use several shapes and
+missing one makes deletion look broken:
+
+| shape | `get_texttrace()` reports | treated as |
+| --- | --- | --- |
+| render mode 3 | `type` 3 | hidden |
+| zero opacity | `opacity` 0 | hidden |
+| white fill (old OCR tools) | `type` 0, `color` ≈ (1,1,1) | hidden |
+| clip-only, render mode 7 | **nothing at all** — the span is absent | hidden, but only reachable via the selection rect |
+| modes 4/5/6 (clip + paint) | `type` 0 or 1 | visible |
+
+`_clearable_rects()` then plans the deletion:
+
+- **No visible glyph intersects the selection** (the normal scan case): the selection rect itself is
+  cleared, which is also the only way to reach clip-only mode-7 text.
+- Any hidden span whose bbox overlaps the selection by at least `COVERAGE_TO_DELETE` (20%) is cleared
+  **whole**, including the part outside the selection. Selections never align with the OCR layer's own
+  boxes, so per-glyph deletion left fragments; this is the behaviour users expect. Below the threshold the
+  span is untouched, which keeps a barely clipped neighbouring line safe.
+- A hidden span overlapping visible ink is skipped and counted as `lines_protected`.
+
+`_clear_invisible_text()` redacts with `add_redact_annot(rect, fill=False)` +
+`apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is
+essential** — the default `fill=(1, 1, 1)` paints a white rectangle over the scan.
+
+Boxes are grouped by page, and a page's redactions are applied **before** any text is inserted; reversing
+that order makes `apply_redactions()` strip the text just written.
+
+**The appearance guard makes the invariant enforced rather than intended.** Each touched page is rendered
+at `VERIFY_DPI` before and after clearing; if the bytes differ, something visible was removed, so
+`_restore_page()` reinstates the page from a pristine second handle on the original file and
+`pages_appearance_guarded` is reported. The correction is still inserted. This covers any future
+classification gap in `_is_hidden()` — a misclassified layer fails closed instead of destroying content.
+`test_appearance_guard_refuses_a_damaging_deletion` monkey-patches `_visible_boxes` to empty to force that
+path.
+
+`check_pdf_text.py --modes` prints each span's render mode and hidden/visible verdict using the app's own
+`_is_hidden()`, and flags the character-count gap that indicates clip-only text. It is the first thing to
+run when deletion appears to do nothing on a real file.
 
 `_region_text()` returns `(visible_text, invisible_text)` for a region, filtered per glyph rather than via
 `get_text(clip=...)`. `/api/ocr` surfaces both so the UI can say "this hidden text will go" and "this

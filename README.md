@@ -149,14 +149,46 @@ Per region the panel shows what it found:
   visible text is already correct, the region probably needs no correction at all,
   since adding your text on top would just create a second copy for searches.
 
-Two details worth knowing:
+Three details worth knowing:
 
-- Deletion is per character, not per line — a box covering half a hidden word
-  leaves the other half. Draw boxes that fully cover what should go.
-- A hidden glyph that physically overlaps visible ink cannot be removed without
-  taking the ink with it, so it is kept and counted in the save banner as
-  *"N hidden character(s) were kept because visible text overlaps them"*. Rare
-  outside watermarked or double-layered files.
+- **A hidden line goes whole once your box covers about 20% of it**, including the
+  part sticking out past your selection. Selections never line up exactly with the
+  OCR layer's own boxes, so this is what stops fragments being left behind. Clip
+  only a sliver of a neighbouring line and that line is left alone.
+- A hidden line that physically overlaps visible ink cannot be removed without
+  taking the ink with it, so it is kept and counted in the save banner as *"N
+  hidden line(s) were kept because visible text overlaps them"*. Rare outside
+  watermarked or double-layered files.
+- As a last check, each touched page is **rendered before and after** the
+  deletion. If anything visible changed, the deletion is thrown away, the page is
+  restored exactly as it was, and the banner says so — your correction is still
+  added. So "the page cannot lose visible words" is enforced, not just intended.
+
+### If deleting the old text seems to do nothing
+
+Hidden OCR layers come in several shapes, and it is worth checking which one your
+file uses:
+
+```
+# Windows
+.venv\Scripts\python check_pdf_text.py "path\to\file.pdf" --modes --page 1
+# macOS / Linux
+.venv/bin/python check_pdf_text.py "path/to/file.pdf" --modes --page 1
+```
+
+That lists every text span with its render mode and whether the app treats it as
+hidden or visible. Handled shapes:
+
+| shape | how it appears | handled |
+| --- | --- | --- |
+| render mode 3 | `HIDDEN mode=3` | yes — the standard OCR layer |
+| zero opacity | `HIDDEN opacity=0.0` | yes |
+| white fill | `HIDDEN mode=0 colour=(1.0, 1.0, 1.0)` | yes — what older OCR tools used |
+| clip-only (mode 7) | not listed at all; the tool prints a NOTE about untraceable characters | yes, via the selection rectangle, but only where the area has no visible text |
+
+If a span shows as `visible` but you know it is not drawn on the page, that is a
+classification gap — the appearance guard will refuse to delete it, so nothing
+breaks, but it will not be removed either.
 
 Regardless of these settings, every crop is upscaled if small, contrast-
 normalised and unsharp-masked before OCR.
@@ -224,15 +256,18 @@ unfindable, and confirm the page still looks unchanged.
 .venv/bin/python -m unittest test_app
 ```
 
-41 tests covering the parts that can fail silently: text lands inside the box you
+46 tests covering the parts that can fail silently: text lands inside the box you
 drew, it is written in invisible render mode, the rendered page stays
 byte-identical to the original, the source file is never modified, deleting a
-hidden OCR layer removes it without changing a pixel, **visible text survives even
-a whole-page selection**, hidden glyphs overlapping visible ink are protected,
-boxes on `/Rotate 90/180/270` pages land where you drew them (checked against
-rendered pixels, not against another PyMuPDF call), accents survive and
-unsupported characters are reported, and the API rejects bad input. The OCR tests
-skip themselves if Tesseract is missing.
+hidden OCR layer removes it without changing a pixel, a partly covered hidden line
+goes whole while a barely clipped one is left alone (both sides of the 20%
+threshold), mode 3 / zero-opacity / white-fill / clip-only layers are all handled,
+**visible text survives even a whole-page selection**, hidden lines overlapping
+visible ink are protected, the appearance guard restores a page when deletion would
+have changed the render, boxes on `/Rotate 90/180/270` pages land where you drew
+them (checked against rendered pixels, not against another PyMuPDF call), accents
+survive and unsupported characters are reported, and the API rejects bad input. The
+OCR tests skip themselves if Tesseract is missing.
 
 There is also an **optional** frontend test suite. It needs Node.js, which the
 app itself does not:
@@ -259,8 +294,9 @@ edits rather than Tesseract's guess.
 | Dependency install failed / broken venv | Delete the `.venv` folder and run the start script again. |
 | OCR returns nothing for a box | Try a different **Layout** mode, raise **OCR DPI**, or tick **B/W**. Very small boxes read better as *Single word* / *Single line*. |
 | Text embedded but selection sits too high or low | Redraw the box to hug the text block more tightly; the layer is fitted to the box, not to the ink. |
-| Old wrong text still there after saving | The region's **Delete the old OCR text here** box was unticked, or your box did not fully cover it (deletion is per character). Redraw it a little larger. |
-| Old text still there and the banner mentions protected characters | Those hidden glyphs overlap visible ink, so removing them would have erased visible words. Nothing to fix — the visible text is authoritative there. |
+| Old wrong text still there after saving | The region's **Delete the old OCR text here** box was unticked, or your box overlapped less than ~20% of the hidden line. Redraw it larger, and see *"If deleting the old text seems to do nothing"* above. |
+| Banner mentions protected lines | Those hidden lines overlap visible ink, so removing them would have erased visible words. Nothing to fix — the visible text is authoritative there. |
+| Banner says the deletion "would have changed how the page looks" | The appearance guard rejected it and restored the page. Usually means the text you boxed is actually drawn on the page, so it should not be deleted anyway. |
 | Browser did not open | Open the URL printed in the console manually. Set `PDFOCR_NO_BROWSER=1` to disable auto-open. |
 | Want a different port | `PDFOCR_PORT=9000` before launching. |
 
