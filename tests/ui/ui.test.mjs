@@ -65,10 +65,17 @@ window.fetch = async (url, opts = {}) => {
         pages: [{ index: 0, width: 595, height: 842, rotation: 0, has_text: false }],
       });
     case '/api/ocr':
-      return json({ text: OCR_TEXT, existing_text: '', crop_size: [100, 40], preview: 'data:image/png;base64,AAAA' });
+      return json({
+        text: OCR_TEXT,
+        existing_text: 'W5O62 l84 (wrong OCR layer)',
+        existing_visible: false,
+        crop_size: [100, 40],
+        preview: 'data:image/png;base64,AAAA',
+      });
     case '/api/save':
       return json({
         boxes_applied: 1, lines_written: 1, unsupported_chars: [],
+        chars_removed: 27, visible_text_removed: false,
         output_name: 'scan_ocr-fixed.pdf', download_url: '/api/download/x',
       });
     default:
@@ -132,6 +139,16 @@ await tick(40);   // the second region's OCR lands mid-typing
 ok(doc.activeElement === doc.querySelector('.card textarea'), 'caret stays in region 1');
 ok(doc.querySelector('.card textarea').selectionStart === 6, 'caret offset preserved');
 
+group('replacing existing text is opt-out per region');
+const firstCard = doc.querySelector('.card');
+const replaceBox = firstCard.querySelector('.note-check input');
+ok(!!replaceBox, 'a per-region "delete existing text" checkbox appears when the area has text');
+ok(replaceBox.checked, 'it defaults to on, following the global setting');
+ok(!firstCard.querySelector('.note').classList.contains('warn'),
+  'an invisible existing layer is not flagged as dangerous');
+replaceBox.checked = false;
+replaceBox.dispatchEvent(new window.Event('change', { bubbles: true }));
+
 group('saving sends the edited text, not the OCR guess');
 doc.getElementById('save').click();
 await tick();
@@ -142,6 +159,11 @@ ok(payload.boxes.length === 2, `both regions sent (got ${payload.boxes.length})`
 ok(payload.boxes[0].text === 'EDITED FIRST', `region 1 carries the edit (got "${payload.boxes[0].text}")`);
 ok(Math.abs(payload.boxes[0].rect.x0 - 0.1) < 1e-9, 'normalised coordinates passed through unchanged');
 ok(payload.doc_id === 'a'.repeat(32), 'doc id passed through');
+ok(payload.replace_existing === true, 'global replace setting sent');
+ok(payload.boxes[0].replace === false, 'region 1 opted out of replacement');
+ok(payload.boxes[1].replace === true, 'region 2 kept the default');
+ok(doc.getElementById('banner').textContent.includes('27 character'),
+  'save banner reports how much old text was removed');
 
 group('deleting a region');
 doc.querySelector('.card-head .del').click();

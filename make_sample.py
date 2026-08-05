@@ -47,6 +47,30 @@ PAGES = [
             "Inspector: R. Alvarez        Date: 12 March 2024",
         ],
     },
+    {
+        "title": "Quarterly Field Report - Page 3",
+        "text_layer": [
+            "Page 3 carries a BAD OCR layer: the grey block below already has",
+            "invisible text behind it, but the characters are wrong. Select it",
+            "and save with 'Replace text' on to throw the bad text away.",
+        ],
+        "image_only": [
+            "STATION 22 - OUTFLOW READINGS",
+            "",
+            "Flow rate ......... 214.9 L/min",
+            "Turbidity ........ 1.2 NTU",
+            "Sample ID ........ QF-3480-C",
+        ],
+        # Invisible, deliberately garbled text sitting over the image above -
+        # what a real scanner's OCR pass leaves behind when it misreads.
+        "bad_ocr": [
+            "5TAT1ON ZZ - OUTFL0W REA D1NGS",
+            "",
+            "F1ow ra7e ......... Z14.9 1/m1n",
+            "Turb1d1ty ........ l.Z NTU",
+            "5amp1e 1D ........ QF-348O-<",
+        ],
+    },
 ]
 
 PAGE_W, PAGE_H = 595, 842  # A4 in points
@@ -96,6 +120,16 @@ def main() -> None:
         block = fitz.Rect(MARGIN, y + 18, PAGE_W - MARGIN, y + 18 + 175)
         page.insert_image(block, stream=_render_block(spec["image_only"],
                                                       block.width, block.height))
+
+        # A wrong invisible text layer over the image, matching how the block
+        # was laid out, so it lines up with the picture like real OCR output.
+        for i, line in enumerate(spec.get("bad_ocr", [])):
+            if not line:
+                continue
+            page.insert_text(
+                fitz.Point(block.x0 + 20, block.y0 + 26 + 17 * i),
+                line, fontname="cour", fontsize=10.5, render_mode=3,
+            )
 
         note_y = block.y1 + 26
         page.insert_text(
