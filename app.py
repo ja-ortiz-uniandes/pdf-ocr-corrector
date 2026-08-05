@@ -176,37 +176,125 @@ def _text_rect(page: fitz.Page, view_rect: fitz.Rect) -> fitz.Rect:
     return (view_rect * page.derotation_matrix).normalize()
 
 
-def _region_text(page: fitz.Page, text_rect: fitz.Rect) -> tuple[str, bool]:
+def _region_text(page: fitz.Page, text_rect: fitz.Rect) -> tuple[str, str]:
     """
-    Return the text already inside `text_rect` and whether any of it is *visible*.
+    Return `(visible_text, invisible_text)` found inside `text_rect`.
 
     `text_rect` must already be in unrotated space (see `_text_rect`).
 
-    The visibility distinction decides whether clearing the region is safe: a
-    scanned page's bad OCR layer is drawn in render mode 3, so removing it changes
-    nothing on screen, while removing visible text erases words the reader can see.
+    Splitting the two matters because only the invisible half is ever deleted: a
+    scanned page's bad OCR layer is drawn in render mode 3, so dropping it changes
+    nothing on screen, whereas visible text *is* the page and must survive.
     """
-    text = page.get_text("text", clip=text_rect).strip()
-    if not text:
-        return "", False
+    visible: list[str] = []
+    invisible: list[str] = []
+    for span in page.get_texttrace():
+        if not fitz.Rect(span["bbox"]).intersects(text_rect):
+            continue
+        chars = "".join(
+            chr(ch[0]) for ch in span["chars"]
+            if fitz.Rect(ch[3]).intersects(text_rect)
+        )
+        if not chars.strip():
+            continue
+        (invisible if span["type"] == INVISIBLE else visible).append(chars.strip())
+    return " ".join(visible).strip(), " ".join(invisible).strip()
 
+
+def _visible_boxes(page: fitz.Page) -> list[fitz.Rect]:
+    """Bounding boxes of every glyph that actually paints ink on this page."""
+    boxes: list[fitz.Rect] = []
     for span in page.get_texttrace():
         if span["type"] == INVISIBLE:
             continue
-        if fitz.Rect(span["bbox"]).intersects(text_rect):
-            return text, True
-    return text, False
+        for ch in span["chars"]:
+            box = fitz.Rect(ch[3])
+            if not box.is_empty:
+                boxes.append(box)
+    return boxes
 
 
-def _clear_region_text(page: fitz.Page, rects: list[fitz.Rect]) -> None:
+def _invisible_runs(page: fitz.Page, text_rect: fitz.Rect,
+                    visible: list[fitz.Rect]) -> tuple[list[fitz.Rect], str, int]:
     """
-    Delete every text object intersecting `rects` (unrotated space), leaving
-    pixels untouched.
+    Work out exactly what may be deleted inside `text_rect`.
+
+    Returns `(rects, removed_text, protected)`:
+      * `rects`        - boxes to redact, covering *only* invisible glyphs
+      * `removed_text` - the text those boxes will delete, for reporting
+      * `protected`    - invisible glyphs left alone because a visible glyph
+                         overlaps them, so redacting would have taken ink with it
+
+    Redaction has no render-mode filter: it deletes every glyph meeting the
+    rectangle. Passing the user's whole box would therefore delete visible text
+    too, so runs of adjacent invisible glyphs are collected instead, each checked
+    against the visible glyphs first. Boxes are shrunk slightly so that merely
+    touching a neighbouring glyph does not drag it in.
+    """
+    inset = 0.3
+    rects: list[fitz.Rect] = []
+    removed: list[str] = []
+    protected = 0
+
+    def safe(box: fitz.Rect) -> bool:
+        return not any(box.intersects(v) for v in visible)
+
+    for span in page.get_texttrace():
+        if span["type"] != INVISIBLE:
+            continue
+        if not fitz.Rect(span["bbox"]).intersects(text_rect):
+            continue
+
+        run: fitz.Rect | None = None
+        run_chars: list[str] = []
+
+        def flush() -> None:
+            nonlocal run, protected
+            if run is None:
+                return
+            if safe(run):
+                rects.append(run)
+                removed.append("".join(run_chars))
+            else:
+                # Fall back to per-glyph boxes so one collision does not block
+                # the whole run.
+                for box, char in zip(run_boxes, run_chars):
+                    if safe(box):
+                        rects.append(box)
+                        removed.append(char)
+                    else:
+                        protected += 1
+            run = None
+            run_chars.clear()
+            run_boxes.clear()
+
+        run_boxes: list[fitz.Rect] = []
+        for ch in span["chars"]:
+            box = fitz.Rect(ch[3])
+            if box.is_empty or not box.intersects(text_rect):
+                flush()
+                continue
+            box = fitz.Rect(box.x0 + inset, box.y0 + inset,
+                            box.x1 - inset, box.y1 - inset)
+            if box.is_empty:
+                box = fitz.Rect(ch[3])
+            run_boxes.append(box)
+            run_chars.append(chr(ch[0]))
+            run = box if run is None else (run | box)
+        flush()
+
+    return rects, "".join(removed), protected
+
+
+def _clear_invisible_text(page: fitz.Page, rects: list[fitz.Rect]) -> None:
+    """
+    Delete the glyphs covered by `rects` (unrotated space), leaving pixels alone.
 
     fill=False matters: add_redact_annot defaults to fill=(1, 1, 1), which would
-    paint a white rectangle over the scan. Removal is per glyph, not per line, so
-    a box covering half a word leaves the other half behind.
+    paint a white rectangle over the scan.
     """
+    if not rects:
+        return
     for rect in rects:
         page.add_redact_annot(rect, fill=False)
     page.apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)
@@ -458,7 +546,7 @@ def ocr():
         # get_pixmap() clips in view space - the same space the browser drew in.
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
         raw = Image.open(io.BytesIO(pix.tobytes("png")))
-        existing, existing_visible = _region_text(page, _text_rect(page, rect))
+        visible_text, invisible_text = _region_text(page, _text_rect(page, rect))
     finally:
         doc.close()
 
@@ -479,8 +567,8 @@ def ocr():
 
     return jsonify({
         "text": text,
-        "existing_text": existing,
-        "existing_visible": existing_visible,
+        "existing_invisible_text": invisible_text,
+        "existing_visible_text": visible_text,
         "crop_size": [prepped.width, prepped.height],
         "preview": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
     })
@@ -507,7 +595,7 @@ def save():
     applied = 0
     lines_written = 0
     chars_removed = 0
-    visible_removed = False
+    glyphs_protected = 0
     dropped_chars: set[str] = set()
     try:
         # Group by page so each page's redactions can be applied in one pass
@@ -534,16 +622,18 @@ def save():
         for page_no, items in sorted(by_page.items()):
             page = doc[page_no]
 
-            to_clear = []
+            # Only invisible glyphs are ever deleted; visible text is never
+            # touched, so a box overlapping real ink cannot damage the page.
+            visible = _visible_boxes(page)
+            to_clear: list[fitz.Rect] = []
             for rect, _, replace in items:
                 if not replace:
                     continue
-                old, was_visible = _region_text(page, rect)
-                chars_removed += len(old)
-                visible_removed = visible_removed or was_visible
-                to_clear.append(rect)
-            if to_clear:
-                _clear_region_text(page, to_clear)
+                run_rects, removed_text, protected = _invisible_runs(page, rect, visible)
+                chars_removed += len(removed_text.strip())
+                glyphs_protected += protected
+                to_clear.extend(run_rects)
+            _clear_invisible_text(page, to_clear)
 
             for rect, text, _ in items:
                 clean, dropped = _sanitize(text)
@@ -564,7 +654,7 @@ def save():
         "boxes_applied": applied,
         "lines_written": lines_written,
         "chars_removed": chars_removed,
-        "visible_text_removed": visible_removed,
+        "glyphs_protected": glyphs_protected,
         "unsupported_chars": sorted(dropped_chars),
         "output_name": out_path.name,
         "output_path": str(out_path),

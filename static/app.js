@@ -47,6 +47,11 @@ function banner(msg, kind) {
   el.banner.textContent = msg;
 }
 
+function trim(s, max) {
+  const flat = String(s).replace(/\s+/g, ' ').trim();
+  return flat.length > max ? flat.slice(0, max) + '…' : flat;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -259,8 +264,8 @@ function addBox(rect, psmOverride) {
     text: '',
     busy: true,
     preview: null,
-    existing: '',
-    existingVisible: false,
+    existingInvisible: '',
+    existingVisible: '',
     replace: el.replace.checked,   // per box, seeded from the global setting
     err: null,
   };
@@ -294,8 +299,8 @@ async function runOcr(box, psmOverride) {
     });
     box.text = out.text || '';
     box.preview = out.preview;
-    box.existing = out.existing_text || '';
-    box.existingVisible = !!out.existing_visible;
+    box.existingInvisible = out.existing_invisible_text || '';
+    box.existingVisible = out.existing_visible_text || '';
     status(box.text ? `region #${indexOf(box)} read` : `region #${indexOf(box)}: nothing found`);
   } catch (err) {
     box.err = err.message;
@@ -450,27 +455,35 @@ function renderList() {
       note.className = 'note warn';
       note.textContent = 'OCR error: ' + b.err;
       card.appendChild(note);
-    } else if (b.existing) {
-      const wrap = document.createElement('div');
-      wrap.className = 'note' + (b.existingVisible ? ' warn' : '');
+    } else {
+      if (b.existingInvisible) {
+        const wrap = document.createElement('div');
+        wrap.className = 'note';
 
-      const chk = document.createElement('label');
-      chk.className = 'note-check';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = b.replace;
-      cb.addEventListener('change', () => { b.replace = cb.checked; state.saved = false; });
-      chk.append(cb, document.createTextNode(' Delete the existing text here'));
-      wrap.appendChild(chk);
+        const chk = document.createElement('label');
+        chk.className = 'note-check';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = b.replace;
+        cb.addEventListener('change', () => { b.replace = cb.checked; state.saved = false; });
+        chk.append(cb, document.createTextNode(' Delete the old OCR text here'));
+        wrap.appendChild(chk);
 
-      const detail = document.createElement('div');
-      detail.textContent = b.existingVisible
-        ? 'Careful: the text here is VISIBLE on the page, so deleting it removes '
-          + 'words the reader can see: ' + b.existing.replace(/\s+/g, ' ').slice(0, 80)
-        : 'This area has an invisible text layer (wrong OCR). Deleting it changes '
-          + 'nothing visually: ' + b.existing.replace(/\s+/g, ' ').slice(0, 80);
-      wrap.appendChild(detail);
-      card.appendChild(wrap);
+        const detail = document.createElement('div');
+        detail.textContent = 'Wrong OCR text hidden here: '
+          + trim(b.existingInvisible, 80)
+          + ' - invisible, so deleting it changes nothing on the page.';
+        wrap.appendChild(detail);
+        card.appendChild(wrap);
+      }
+      if (b.existingVisible) {
+        const note = document.createElement('div');
+        note.className = 'note';
+        note.textContent = 'This area also has visible text, which is always kept: '
+          + trim(b.existingVisible, 70)
+          + ' - if it is already correct, this region may not need a correction.';
+        card.appendChild(note);
+      }
     }
 
     card.addEventListener('pointerdown', (e) => {
@@ -515,10 +528,12 @@ el.save.addEventListener('click', async () => {
     state.saved = true;
     let msg = `Saved ${out.boxes_applied} region(s), ${out.lines_written} line(s) of invisible text.`;
     if (out.chars_removed) {
-      msg += ` Removed ${out.chars_removed} character(s) of old text`;
-      msg += out.visible_text_removed
-        ? ' (some of it was VISIBLE on the page - check the result).'
-        : ' (all of it invisible, so the page looks unchanged).';
+      msg += ` Deleted ${out.chars_removed} character(s) of old OCR text`
+        + ' (invisible only - the page looks unchanged).';
+    }
+    if (out.glyphs_protected) {
+      msg += ` ${out.glyphs_protected} hidden character(s) were kept because visible`
+        + ' text overlaps them.';
     }
     if (empty) msg += ` ${empty} empty region(s) skipped.`;
     if (out.unsupported_chars.length) {
