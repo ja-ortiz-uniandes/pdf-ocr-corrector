@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF OCR Corrector</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">PDF&nbsp;OCR&nbsp;Corrector <span class="local">local only</span></div>
+
+  <label class="btn primary">
+    Open PDF…
+    <input type="file" id="file" accept="application/pdf" hidden>
+  </label>
+
+  <span class="docname" id="docname">no file loaded</span>
+
+  <div class="spacer"></div>
+
+  <div class="group" id="pagenav" hidden>
+    <button class="btn" id="prev" title="Previous page">‹</button>
+    <span class="pageinfo"><input type="number" id="pageno" min="1" value="1"> / <b id="pagecount">0</b></span>
+    <button class="btn" id="next" title="Next page">›</button>
+  </div>
+
+  <div class="group" id="zoomgrp" hidden>
+    <button class="btn" id="zoomout" title="Zoom out">−</button>
+    <span class="zoomval" id="zoomval">100%</span>
+    <button class="btn" id="zoomin" title="Zoom in">+</button>
+    <button class="btn" id="fitw" title="Fit width">Fit</button>
+  </div>
+
+  <button class="btn" id="wholepage" hidden title="Add a box covering the whole page">Whole page</button>
+  <button class="btn primary" id="save" hidden>Save PDF</button>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<main>
+  <section id="viewer" class="viewer">
+    <div id="dropzone" class="dropzone">
+      <h1>Patch missing OCR text into a PDF</h1>
+      <ol>
+        <li>Open a PDF (or drop one here).</li>
+        <li>Drag a box over text that is missing or wrong.</li>
+        <li>Check what Tesseract read, fix it in the panel.</li>
+        <li>Save — you get a new PDF with an invisible, searchable text layer.</li>
+      </ol>
+      <p class="muted">Nothing leaves this machine. The original file is never modified.</p>
+    </div>
+
+    <div id="pagewrap" class="pagewrap" hidden>
+      <img id="pageimg" alt="PDF page" draggable="false">
+      <div id="overlay" class="overlay"></div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <div class="side-head">
+      <div class="row">
+        <label>Language
+          <select id="lang"></select>
+        </label>
+        <label>Layout
+          <select id="psm">
+            <option value="7">Single line</option>
+            <option value="8">Single word</option>
+            <option value="6" selected>Block of text</option>
+            <option value="4">Column of lines</option>
+            <option value="3">Auto (full page)</option>
+            <option value="11">Sparse text</option>
+            <option value="13">Raw line</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>OCR DPI
+          <select id="ocrdpi">
+            <option value="300">300</option>
+            <option value="400" selected>400</option>
+            <option value="600">600</option>
+            <option value="900">900 (slow)</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="binarize"> B/W</label>
+        <label class="check"><input type="checkbox" id="invert"> Invert</label>
+      </div>
+      <div class="row tight">
+        <span class="muted small" id="tessinfo">checking Tesseract…</span>
+      </div>
+    </div>
+
+    <div id="boxlist" class="boxlist">
+      <p class="muted pad">No regions yet. Drag a box on the page.</p>
+    </div>
+
+    <div class="side-foot">
+      <span class="muted small" id="status">ready</span>
+    </div>
+  </aside>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
