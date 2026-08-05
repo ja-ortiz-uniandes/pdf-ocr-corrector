@@ -763,6 +763,170 @@ class TestReplaceExistingText(Base):
         self.assertEqual(body["existing_invisible_text"], "")
 
 
+class TestHiddenSpanListing(Base):
+    """The /api/hidden endpoint backs the clickable outlines in the viewer."""
+
+    BAD_PAGE = 2
+
+    def test_lists_hidden_text_with_view_space_rects(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        res = self.client.get(f"/api/hidden/{doc_id}/{self.BAD_PAGE}")
+        self.assertEqual(res.status_code, 200)
+        spans = res.get_json()["spans"]
+        self.assertEqual(len(spans), 4, "page 3 has four hidden lines")
+
+        joined = " ".join(s["text"] for s in spans)
+        self.assertIn("QF-348O-<", joined)
+        self.assertIn("Turb1d1ty", joined)
+
+        for span in spans:
+            rect = span["rect"]
+            for key in ("x0", "y0", "x1", "y1"):
+                self.assertGreaterEqual(rect[key], 0)
+                self.assertLessEqual(rect[key], 1)
+            self.assertLess(rect["x0"], rect["x1"])
+            self.assertLess(rect["y0"], rect["y1"])
+        ys = [s["rect"]["y0"] for s in spans]
+        self.assertEqual(ys, sorted(ys), "spans should come back in reading order")
+
+    def test_visible_text_is_not_listed(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        spans = self.client.get(f"/api/hidden/{doc_id}/0").get_json()["spans"]
+        joined = " ".join(s["text"] for s in spans)
+        self.assertNotIn("This paragraph", joined)
+        self.assertEqual(spans, [], "page 1 has no hidden text at all")
+
+    def test_rects_match_where_the_text_really_is(self):
+        """A listed rect, sent straight back as a selection, must clear that line."""
+        doc_id = self.upload(SAMPLE.read_bytes())
+        spans = self.client.get(f"/api/hidden/{doc_id}/{self.BAD_PAGE}").get_json()["spans"]
+        target = next(s for s in spans if "QF-348O-<" in s["text"])
+
+        out = self.save(doc_id, [{
+            "page": self.BAD_PAGE, "rect": target["rect"],
+            "delete_only": True, "text": "",
+        }])
+        self.assertEqual(out["boxes_deleted_only"], 1)
+        doc = fitz.open(out["output_path"])
+        try:
+            text = doc[self.BAD_PAGE].get_text("text")
+            self.assertNotIn("QF-348O-<", text, "clicking the outline should clear it")
+            self.assertIn("Turb1d1ty", text, "other hidden lines must be left alone")
+        finally:
+            doc.close()
+
+    def test_rects_are_view_space_on_rotated_pages(self):
+        for rotation in (90, 180, 270):
+            with self.subTest(rotation=rotation):
+                src = fitz.open(SAMPLE)
+                src[self.BAD_PAGE].set_rotation(rotation)
+                data = src.tobytes()
+                src.close()
+
+                doc_id = self.upload(data, f"hidden-rot{rotation}.pdf")
+                spans = self.client.get(
+                    f"/api/hidden/{doc_id}/{self.BAD_PAGE}").get_json()["spans"]
+                target = next(s for s in spans if "QF-348O-<" in s["text"])
+                out = self.save(doc_id, [{
+                    "page": self.BAD_PAGE, "rect": target["rect"],
+                    "delete_only": True, "text": "",
+                }])
+                doc = fitz.open(out["output_path"])
+                try:
+                    self.assertNotIn("QF-348O-<", doc[self.BAD_PAGE].get_text("text"),
+                                     f"rot {rotation}: rect did not map back correctly")
+                finally:
+                    doc.close()
+
+    def test_reports_untraceable_clip_mode_text(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 100), "clip only text here", fontname="helv",
+                         fontsize=11, render_mode=7)
+        data = doc.tobytes()
+        doc.close()
+
+        doc_id = self.upload(data, "cliponly.pdf")
+        body = self.client.get(f"/api/hidden/{doc_id}/0").get_json()
+        self.assertEqual(body["spans"], [], "clip-mode text cannot be outlined")
+        self.assertGreater(body["untraceable_chars"], 0,
+                           "the UI needs to know outlines are incomplete")
+
+    def test_bad_requests(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        self.assertEqual(self.client.get(f"/api/hidden/{doc_id}/99").status_code, 404)
+        self.assertEqual(self.client.get("/api/hidden/nope/0").status_code, 400)
+
+
+class TestDeleteOnlyBoxes(Base):
+    BAD_PAGE = 2
+    BLOCK = {"x0": 0.094, "y0": 0.200, "x1": 0.906, "y1": 0.400}
+
+    def test_delete_only_writes_no_text(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        out = self.save(doc_id, [{
+            "page": self.BAD_PAGE, "rect": self.BLOCK, "delete_only": True, "text": "",
+        }])
+        self.assertEqual(out["boxes_applied"], 0)
+        self.assertEqual(out["boxes_deleted_only"], 1)
+        self.assertEqual(out["lines_written"], 0)
+        self.assertGreater(out["chars_removed"], 0)
+
+        doc = fitz.open(out["output_path"])
+        try:
+            text = doc[self.BAD_PAGE].get_text("text")
+            self.assertNotIn("QF-348O-<", text)
+            self.assertIn("Quarterly Field Report - Page 3", text, "page text intact")
+        finally:
+            doc.close()
+
+    def test_empty_box_without_the_flag_is_still_ignored(self):
+        """An empty OCR result must never be taken as "delete this area"."""
+        doc_id = self.upload(SAMPLE.read_bytes())
+        res = self.client.post("/api/save", json={"doc_id": doc_id, "boxes": [
+            {"page": self.BAD_PAGE, "rect": self.BLOCK, "text": "   ", "replace": True},
+        ]})
+        self.assertEqual(res.status_code, 400, "nothing to do -> rejected")
+
+    def test_delete_only_mixes_with_normal_boxes(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        out = self.save(doc_id, [
+            {"page": self.BAD_PAGE, "rect": {"x0": 0.094, "y0": 0.200, "x1": 0.906, "y1": 0.28},
+             "delete_only": True, "text": ""},
+            {"page": self.BAD_PAGE, "rect": {"x0": 0.094, "y0": 0.28, "x1": 0.906, "y1": 0.400},
+             "text": "Sample ID QF-3480-C"},
+        ])
+        self.assertEqual(out["boxes_applied"], 1)
+        self.assertEqual(out["boxes_deleted_only"], 1)
+        doc = fitz.open(out["output_path"])
+        try:
+            text = doc[self.BAD_PAGE].get_text("text")
+            self.assertIn("Sample ID QF-3480-C", text)
+            self.assertNotIn("5TAT1ON", text)
+            self.assertNotIn("QF-348O-<", text)
+        finally:
+            doc.close()
+
+    def test_delete_only_still_cannot_touch_visible_text(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        out = self.save(doc_id, [{
+            "page": 0, "rect": {"x0": 0.05, "y0": 0.115, "x1": 0.95, "y1": 0.165},
+            "delete_only": True, "text": "",
+        }])
+        self.assertEqual(out["chars_removed"], 0)
+        original = fitz.open(SAMPLE)
+        patched = fitz.open(out["output_path"])
+        try:
+            self.assertIn("This paragraph has a proper text layer.",
+                          patched[0].get_text("text"))
+            self.assertEqual(
+                original[0].get_pixmap(dpi=110).tobytes("png"),
+                patched[0].get_pixmap(dpi=110).tobytes("png"))
+        finally:
+            original.close()
+            patched.close()
+
+
 class TestSanitize(unittest.TestCase):
     def test_typographic_folding(self):
         clean, dropped = A._sanitize("“A” – B… ’")
