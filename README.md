@@ -188,6 +188,20 @@ rotations place text identically, accents survive and unsupported characters are
 reported, and the API rejects bad input. The OCR tests skip themselves if
 Tesseract is missing.
 
+There is also an **optional** frontend test suite. It needs Node.js, which the
+app itself does not:
+
+```
+cd tests/ui
+npm install
+npm test
+```
+
+It drives the real `static/app.js` in jsdom with a stubbed backend and checks
+that the editable text field stays focused while you type, that a region
+finishing OCR does not steal the caret from another, and that Save sends your
+edits rather than Tesseract's guess.
+
 ---
 
 ## 5. Troubleshooting
@@ -215,7 +229,8 @@ that folder is always safe.
 | `static/index.html`, `static/app.js`, `static/style.css` | Frontend — box drawing, editing panel, no external libraries |
 | `make_sample.py` | Builds the test PDF with deliberate OCR gaps |
 | `check_pdf_text.py` | Dumps / searches a PDF's text layer to verify results |
-| `test_app.py` | Test suite (`python -m unittest test_app`) |
+| `test_app.py` | Backend test suite (`python -m unittest test_app`) |
+| `tests/ui/` | Optional jsdom tests for the frontend (needs Node.js) |
 | `start.bat`, `start.sh`, `start.command` | One-click setup + launch |
 | `requirements.txt` | Python dependencies |
 
