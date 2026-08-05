@@ -1,0 +1,13 @@
+{
+  "name": "pdf-ocr-corrector-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional jsdom tests for the frontend. Not needed to run the app.",
+  "scripts": {
+    "test": "node ui.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}
