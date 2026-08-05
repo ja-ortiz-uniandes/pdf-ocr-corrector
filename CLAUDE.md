@@ -24,10 +24,13 @@ start.bat                    # Windows
 .venv/Scripts/python -W ignore::ResourceWarning -m unittest test_app
 
 # A single test or class
-.venv/Scripts/python -m unittest test_app.TestInvisibleText.test_rotated_pages_land_in_the_same_place
-.venv/Scripts/python -m unittest test_app.TestOcr
+.venv/Scripts/python -m unittest test_app.TestInvisibleText.test_rotated_pages_land_on_what_the_user_boxed
+.venv/Scripts/python -m unittest test_app.TestReplaceExistingText
 
-# Regenerate the test PDF (two pages, each mixing a real text layer with an image-only block)
+# Regenerate the 3-page test PDF. Pages 1-2 mix a real text layer with an image-only
+# block; page 3 adds a deliberately garbled INVISIBLE OCR layer over its block, which
+# is the case the `replace` flag exists for. The block's position is hard-coded as
+# BLOCK_UNROTATED in test_app.py, so changing the layout means updating that constant.
 .venv/Scripts/python make_sample.py
 
 # Inspect / verify a PDF's text layer after a save
@@ -60,11 +63,23 @@ invariant; violating it is how zoom-dependent and rotation-dependent bugs get in
   gets saved.
 - `_rect_from_norm()` is the only place normalised coords become PDF points.
 
-**Do not add rotation compensation.** `page.rect`, `page.get_pixmap(clip=...)`, `page.insert_text()` and
-`page.search_for()` all operate in the *rotated view* coordinate system the browser sees, so `/Rotate
-90/180/270` needs no derotation. An earlier version derotated via `page.derotation_matrix` and
-`set_rotation(0)`, which double-compensated and placed text 90° off on rotated pages.
-`test_app.py::test_rotated_pages_land_in_the_same_place` pins this for all four rotations.
+**There are two coordinate systems and they differ on rotated pages.** Getting this wrong is silent:
+everything looks fine at `/Rotate 0`, which most PDFs use.
+
+| space | reported by | used by |
+| --- | --- | --- |
+| **view** (rotated) | `page.rect`, `get_pixmap()` — what the browser renders and the user draws on | `get_pixmap(clip=...)`, i.e. the OCR crop |
+| **unrotated** (rotation-independent) | never changes when `/Rotate` does | `insert_text()`, `get_text()`, `search_for()`, `get_texttrace()`, redaction annotations |
+
+`_rect_from_norm()` produces a **view** rect; `_text_rect()` converts it to unrotated space via
+`page.derotation_matrix`. Every text operation must go through `_text_rect()`; the OCR crop must not.
+
+Beware of writing circular rotation tests: comparing `insert_text()` output against `search_for()` proves
+nothing, because both live in unrotated space, so a wrong view→unrotated mapping stays invisible and the
+test passes. An earlier version shipped exactly that bug behind exactly that test. The current tests anchor
+on `BLOCK_UNROTATED` (taken from `make_sample.py`) and on `find_grey_block()`, which locates the sample's
+grey block in the **rendered pixels** — see `test_block_norm_matches_rendered_pixels` and
+`test_rotated_pages_land_on_what_the_user_boxed`.
 
 ### Region OCR path (`POST /api/ocr`)
 
@@ -76,6 +91,22 @@ Returns the OCR text plus a base64 preview of the exact crop that was fed to Tes
 Tesseract is located by `TESSERACT_CMD`, then `PATH`, then known Windows/macOS/Linux install paths, so
 it works on Windows even when not on PATH. Absence degrades to HTTP 503 with an actionable message, and
 `_tesseract_info()` feeds the UI banner and language dropdown.
+
+### Clearing old text (`replace`)
+
+Boxes carry a `replace` flag (default on, `replace_existing` sets the request-wide default). When set, the
+region's existing text objects are deleted before the new ones are written, so wrong or partial OCR text
+cannot survive alongside the correction.
+
+- `_clear_region_text()` uses `add_redact_annot(rect, fill=False)` + `apply_redactions(images=KEEP_IMAGES,
+  graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is essential** — the default `fill=(1, 1, 1)`
+  paints a white rectangle over the scan.
+- Boxes are grouped by page and all redactions for a page are applied **before** any text is inserted;
+  reversing that order makes `apply_redactions()` strip the text just written.
+- Removal is per glyph, not per line: a box covering half a word leaves the rest behind.
+- `_region_text()` reports whether the existing text is *visible* (`get_texttrace()` span `type` != 3).
+  Deleting an invisible OCR layer is pixel-for-pixel safe; deleting visible text erases words from the
+  page, so that case is surfaced in the UI and in the save response as `visible_text_removed`.
 
 ### Invisible text insertion (`POST /api/save`)
 

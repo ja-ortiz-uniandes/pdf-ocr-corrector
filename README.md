@@ -9,6 +9,10 @@ Tesseract still got wrong. When you save, the app writes an **invisible text
 layer** at those exact coordinates on top of the existing page: the page looks
 pixel-for-pixel identical, but the text is now selectable and searchable.
 
+Any wrong or partial text already inside the box is **deleted first**, so the
+region ends up with exactly the text you approved and nothing else. For a scanned
+page that costs nothing visually, because the bad OCR layer was invisible anyway.
+
 The original PDF is never modified — you always get a new file.
 
 Nothing is uploaded anywhere. The server binds to `127.0.0.1` only, and your
@@ -120,6 +124,28 @@ To stop the app: press `Ctrl+C` in the console window, or just close it.
 | **OCR DPI** | Resolution the crop is re-rendered at before OCR. 400 suits most scans; 600–900 helps tiny print but is slower. |
 | **B/W** | Otsu black-and-white threshold. Helps faded or uneven scans, hurts anti-aliased text. |
 | **Invert** | For light text on a dark background. |
+| **Replace text already in the box** | On by default. Deletes whatever text is already inside the box before writing yours, so wrong or partial OCR text does not survive next to the correction. Turn it off to *add* your text and keep the old text as well. |
+
+### Replacing wrong text vs adding text
+
+When a region already contains text, the panel says so and offers a per-region
+**Delete the existing text here** checkbox (seeded from the global setting), so
+you can decide box by box.
+
+Which message you get matters:
+
+- *"This area has an invisible text layer (wrong OCR)"* — the normal case for a
+  scanned page. Deleting it is completely safe: invisible text is not drawn, so
+  the page still looks pixel-for-pixel identical.
+- *"Careful: the text here is VISIBLE on the page"* — the region contains real,
+  drawn text (a born-digital PDF, or a caption you overlapped). Deleting it
+  **erases words the reader can see**. Either shrink the box or untick the
+  checkbox.
+
+Deletion is per character, not per line: a box covering half a word leaves the
+other half in place. Draw boxes that fully cover what should go. After saving,
+the banner reports how many characters were removed and whether any of them were
+visible.
 
 Regardless of these settings, every crop is upscaled if small, contrast-
 normalised and unsharp-masked before OCR.
@@ -136,12 +162,10 @@ normalised and unsharp-masked before OCR.
   (e.g. CJK, Greek, Cyrillic) are replaced with `?` and the app tells you which
   ones after saving.
 - Encrypted / password-protected PDFs are rejected.
-- Existing text is left untouched. If you box an area that *already* has text,
-  the panel warns you — patching it anyway means that area ends up with both
-  the old and new text.
-- Rotated pages (`/Rotate 90/180/270`) are handled: your box is interpreted in
-  the same rotated view you drew it on, and the page's rotation is preserved in
-  the output. `test_app.py` pins this for all four rotations.
+- Rotated pages (`/Rotate 90/180/270`) are handled: your box is interpreted
+  against the image you drew it on, and the page's rotation is preserved in the
+  output. `test_app.py` checks this against the position of a known block in the
+  rendered pixels, at all four rotations.
 
 ---
 
@@ -158,8 +182,16 @@ image with no text behind it:
 .venv/bin/python make_sample.py
 ```
 
-That writes `samples/sample_missing_ocr.pdf`. Open it in the app, draw a box
-over the grey block, and save. Then confirm the new text is really in the file:
+That writes `samples/sample_missing_ocr.pdf` — three pages:
+
+- **Pages 1-2**: a real text layer plus a grey block that is a flattened image
+  with no text behind it. Tests the "missing text" case.
+- **Page 3**: the same, except the grey block *already* has an invisible text
+  layer with the wrong characters (`5amp1e 1D ........ QF-348O-<`). Tests the
+  "wrong text" case — box it, OCR it, save with **Replace text** on, and the
+  garbled text is gone rather than duplicated.
+
+Open it in the app, draw a box over a grey block, and save. Then confirm the new text is really in the file:
 
 ```
 # Windows
@@ -181,12 +213,14 @@ unfindable, and confirm the page still looks unchanged.
 .venv/bin/python -m unittest test_app
 ```
 
-25 tests covering the parts that can fail silently: text lands inside the box
+38 tests covering the parts that can fail silently: text lands inside the box
 you drew, it is written in invisible render mode, the rendered page stays
-byte-identical to the original, the source file is never modified, all four page
-rotations place text identically, accents survive and unsupported characters are
-reported, and the API rejects bad input. The OCR tests skip themselves if
-Tesseract is missing.
+byte-identical to the original, the source file is never modified, replacing an
+invisible OCR layer removes it without changing a pixel, removal of *visible*
+text is reported, boxes on `/Rotate 90/180/270` pages land where you drew them
+(checked against rendered pixels, not against another PyMuPDF call), accents
+survive and unsupported characters are reported, and the API rejects bad input.
+The OCR tests skip themselves if Tesseract is missing.
 
 There is also an **optional** frontend test suite. It needs Node.js, which the
 app itself does not:
@@ -213,6 +247,8 @@ edits rather than Tesseract's guess.
 | Dependency install failed / broken venv | Delete the `.venv` folder and run the start script again. |
 | OCR returns nothing for a box | Try a different **Layout** mode, raise **OCR DPI**, or tick **B/W**. Very small boxes read better as *Single word* / *Single line*. |
 | Text embedded but selection sits too high or low | Redraw the box to hug the text block more tightly; the layer is fitted to the box, not to the ink. |
+| Old wrong text still there after saving | The region's **Delete the existing text here** box was unticked, or your box did not fully cover the old text (removal is per character). Redraw it a little larger. |
+| Words disappeared from the page | You replaced a region containing *visible* text, which the panel warns about. The original file is untouched — reload it and either shrink the box or untick the replace checkbox. |
 | Browser did not open | Open the URL printed in the console manually. Set `PDFOCR_NO_BROWSER=1` to disable auto-open. |
 | Want a different port | `PDFOCR_PORT=9000` before launching. |
 
