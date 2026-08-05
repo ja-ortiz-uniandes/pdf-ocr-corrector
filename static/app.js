@@ -528,12 +528,17 @@ el.save.addEventListener('click', async () => {
     state.saved = true;
     let msg = `Saved ${out.boxes_applied} region(s), ${out.lines_written} line(s) of invisible text.`;
     if (out.chars_removed) {
-      msg += ` Deleted ${out.chars_removed} character(s) of old OCR text`
-        + ' (invisible only - the page looks unchanged).';
+      msg += ` Deleted ${out.chars_removed} character(s) of old hidden text`
+        + ' (the page still looks the same).';
     }
-    if (out.glyphs_protected) {
-      msg += ` ${out.glyphs_protected} hidden character(s) were kept because visible`
-        + ' text overlaps them.';
+    if (out.lines_protected) {
+      msg += ` ${out.lines_protected} hidden line(s) were kept because visible text`
+        + ' overlaps them.';
+    }
+    if (out.pages_appearance_guarded) {
+      msg += ` On ${out.pages_appearance_guarded} page(s) the deletion would have`
+        + ' changed how the page looks, so the old text was left in place;'
+        + ' your text was still added.';
     }
     if (empty) msg += ` ${empty} empty region(s) skipped.`;
     if (out.unsupported_chars.length) {
