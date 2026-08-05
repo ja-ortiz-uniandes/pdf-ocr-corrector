@@ -48,8 +48,10 @@ const doc = window.document;
 const OCR_TEXT = 'W5062 184 garbled';
 
 const HIDDEN_SPANS = [
-  { text: 'F1ow ra7e Z14.9 1/m1n', mode: 3, rect: { x0: 0.12, y0: 0.25, x1: 0.60, y1: 0.28 } },
-  { text: '5amp1e 1D QF-348O-<', mode: 3, rect: { x0: 0.12, y0: 0.30, x1: 0.55, y1: 0.33 } },
+  { text: 'F1ow ra7e Z14.9 1/m1n', mode: 3, kind: 'invisible',
+    rect: { x0: 0.12, y0: 0.25, x1: 0.60, y1: 0.28 } },
+  { text: '5amp1e 1D QF-348O-<', mode: 0, kind: 'behind image',
+    rect: { x0: 0.12, y0: 0.30, x1: 0.55, y1: 0.33 } },
 ];
 
 window.fetch = async (url, opts = {}) => {
@@ -117,7 +119,10 @@ group('existing hidden text is outlined');
 await tick(20);   // the hidden-text fetch is kicked off by showPage()
 const outlines = () => [...doc.querySelectorAll('.hx')];
 ok(outlines().length === 2, `both hidden objects are outlined (got ${outlines().length})`);
-ok(/Hidden text:/.test(outlines()[0].title), 'the outline shows its text on hover');
+ok(/Hidden text \(invisible text layer\)/.test(outlines()[0].title),
+  'the outline names why the text is hidden');
+ok(/behind the scan image/.test(outlines()[1].title),
+  'buried text is described as being behind the image');
 ok(outlines()[0].style.left === '12%', 'outline positioned from the reported rect');
 doc.getElementById('showhidden').checked = false;
 doc.getElementById('showhidden').dispatchEvent(new window.Event('change', { bubbles: true }));

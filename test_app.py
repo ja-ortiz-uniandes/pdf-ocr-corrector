@@ -118,7 +118,7 @@ class TestUploadAndRender(Base):
     def test_page_metadata(self):
         doc_id = self.upload(SAMPLE.read_bytes())
         meta = A._meta(doc_id)
-        self.assertEqual(len(meta["pages"]), 3)
+        self.assertEqual(len(meta["pages"]), 4)
         self.assertAlmostEqual(meta["pages"][0]["width"], 595, delta=1)
         self.assertAlmostEqual(meta["pages"][0]["height"], 842, delta=1)
 
@@ -380,7 +380,7 @@ class TestReplaceExistingText(Base):
     def test_sample_has_a_bad_invisible_layer(self):
         doc = fitz.open(SAMPLE)
         try:
-            self.assertEqual(doc.page_count, 3)
+            self.assertEqual(doc.page_count, 4)
             page = doc[self.BAD_PAGE]
             rect = A._rect_from_norm(page, self.BAD_BLOCK)
             visible, invisible = A._region_text(page, rect)
@@ -624,7 +624,7 @@ class TestReplaceExistingText(Base):
         doc_id = self.upload(SAMPLE.read_bytes())
         original_visible = A._visible_boxes  # force a misclassification
         try:
-            A._visible_boxes = lambda page: []
+            A._visible_boxes = lambda page, buried=frozenset(): []
             out = self.save(doc_id, [{
                 "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "SHOULD NOT DAMAGE",
             }])
@@ -856,6 +856,179 @@ class TestHiddenSpanListing(Base):
         doc_id = self.upload(SAMPLE.read_bytes())
         self.assertEqual(self.client.get(f"/api/hidden/{doc_id}/99").status_code, 404)
         self.assertEqual(self.client.get("/api/hidden/nope/0").status_code, 400)
+
+
+class TestTextBuriedUnderImage(Base):
+    """
+    Sample page 4: ordinary black OCR text painted *before* the scan image, so the
+    picture hides it completely. Nothing about the span says "hidden", which is why
+    burial is settled by rendering rather than by reading render modes.
+    """
+
+    BURIED_PAGE = 3
+    BLOCK = {"x0": 0.094, "y0": 0.200, "x1": 0.906, "y1": 0.400}
+
+    def test_span_looks_like_ordinary_text(self):
+        doc = fitz.open(SAMPLE)
+        try:
+            page = doc[self.BURIED_PAGE]
+            span = next(s for s in page.get_texttrace()
+                        if "QF-5Ol7-D" in "".join(chr(c[0]) for c in s["chars"]))
+            self.assertEqual(span["type"], 0, "it is a normal fill span")
+            self.assertEqual(span["opacity"], 1.0)
+            self.assertEqual(tuple(span["color"]), (0.0, 0.0, 0.0), "plain black")
+            self.assertIsNone(A._hidden_kind(span),
+                              "nothing about the span alone marks it as hidden")
+        finally:
+            doc.close()
+
+    def test_burial_is_detected_by_rendering(self):
+        doc = fitz.open(SAMPLE)
+        try:
+            page = doc[self.BURIED_PAGE]
+            buried = A._confirm_buried(page, SAMPLE, self.BURIED_PAGE)
+            texts = ["".join(chr(c[0]) for c in s["chars"])
+                     for s in page.get_texttrace() if s.get("seqno") in buried]
+            joined = " ".join(texts)
+            self.assertIn("QF-5Ol7-D", joined, "buried OCR line should be found")
+            self.assertIn("Turb1d1ty", joined)
+            self.assertNotIn("Quarterly Field Report", joined,
+                             "the visible title must not be called buried")
+            self.assertNotIn("grey block above", joined,
+                             "the visible caption must not be called buried")
+        finally:
+            doc.close()
+
+    def test_listed_as_hidden_with_a_reason(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        spans = self.client.get(
+            f"/api/hidden/{doc_id}/{self.BURIED_PAGE}").get_json()["spans"]
+        joined = " ".join(s["text"] for s in spans)
+        self.assertIn("QF-5Ol7-D", joined, "buried text should be outlined in the UI")
+        kinds = {s["kind"] for s in spans}
+        self.assertEqual(kinds, {"behind image"})
+        for span in spans:
+            self.assertNotIn("Quarterly Field Report", span["text"])
+
+    def test_ocr_reports_it_as_hidden_not_visible(self):
+        if not A._tesseract_info()["available"]:
+            self.skipTest("Tesseract is not installed")
+        doc_id = self.upload(SAMPLE.read_bytes())
+        res = self.client.post("/api/ocr", json={
+            "doc_id": doc_id, "page": self.BURIED_PAGE, "rect": self.BLOCK, "psm": 6})
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertIn("QF-5Ol7-D", body["existing_invisible_text"])
+        self.assertEqual(body["existing_visible_text"], "",
+                         "buried text must not be reported as visible")
+
+    def test_deleting_it_works_and_changes_no_pixels(self):
+        doc_id = self.upload(SAMPLE.read_bytes())
+        out = self.save(doc_id, [{
+            "page": self.BURIED_PAGE, "rect": self.BLOCK, "replace": True,
+            "text": "Sample ID QF-5017-D",
+        }])
+        self.assertGreater(out["chars_removed"], 0)
+        self.assertEqual(out["pages_appearance_guarded"], 0)
+
+        original = fitz.open(SAMPLE)
+        patched = fitz.open(out["output_path"])
+        try:
+            text = patched[self.BURIED_PAGE].get_text("text")
+            self.assertNotIn("QF-5Ol7-D", text, "buried garbage survived")
+            self.assertNotIn("5TAT1ON 3l", text)
+            self.assertIn("Sample ID QF-5017-D", text)
+            self.assertIn("Quarterly Field Report - Page 4", text, "title intact")
+            self.assertIn("(The grey block above is an image.", text, "caption intact")
+            self.assertEqual(
+                original[self.BURIED_PAGE].get_pixmap(dpi=110).tobytes("png"),
+                patched[self.BURIED_PAGE].get_pixmap(dpi=110).tobytes("png"),
+                "the page must look exactly the same",
+            )
+        finally:
+            original.close()
+            patched.close()
+
+    def test_text_on_top_of_an_image_is_not_buried(self):
+        """The mirror case: same geometry, opposite draw order, must stay visible."""
+        scratch = fitz.open()
+        sp = scratch.new_page(width=200, height=60)
+        sp.draw_rect(fitz.Rect(0, 0, 200, 60), fill=(0.85, 0.85, 0.82))
+        png = sp.get_pixmap(matrix=fitz.Matrix(2, 2)).tobytes("png")
+        scratch.close()
+
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_image(fitz.Rect(20, 40, 280, 120), stream=png)
+        page.insert_text((30, 90), "CAPTION OVER IMAGE", fontname="helv", fontsize=13)
+        data = doc.tobytes()
+        doc.close()
+
+        probe = fitz.open("pdf", data)
+        try:
+            span = next(s for s in probe[0].get_texttrace()
+                        if "CAPTION" in "".join(chr(c[0]) for c in s["chars"]))
+            self.assertIsNone(A._hidden_kind(span))
+        finally:
+            probe.close()
+
+        doc_id = self.upload(data, "ontop.pdf")
+        listed = self.client.get(f"/api/hidden/{doc_id}/0").get_json()["spans"]
+        self.assertEqual(listed, [], "text drawn on top of an image is not hidden")
+
+        out = self.save(doc_id, [{
+            "page": 0, "rect": {"x0": 0.05, "y0": 0.15, "x1": 0.95, "y1": 0.60},
+            "replace": True, "text": "NEW TEXT",
+        }])
+        self.assertEqual(out["chars_removed"], 0, "visible caption must survive")
+        patched = fitz.open(out["output_path"])
+        try:
+            self.assertIn("CAPTION OVER IMAGE", patched[0].get_text("text"))
+        finally:
+            patched.close()
+
+    def test_a_page_mixing_buried_and_on_top_text(self):
+        """
+        The group probe fails here, so each span has to be tested individually:
+        one line under the image, one over it, same image.
+        """
+        scratch = fitz.open()
+        sp = scratch.new_page(width=300, height=100)
+        sp.draw_rect(fitz.Rect(0, 0, 300, 100), fill=(0.88, 0.88, 0.85))
+        png = sp.get_pixmap(matrix=fitz.Matrix(2, 2)).tobytes("png")
+        scratch.close()
+
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        block = fitz.Rect(30, 50, 370, 170)
+        page.insert_text((40, 90), "BURIED LINE HERE", fontname="helv", fontsize=12)
+        page.insert_image(block, stream=png)
+        page.insert_text((40, 150), "ON TOP LINE HERE", fontname="helv", fontsize=12)
+        data = doc.tobytes()
+        doc.close()
+
+        doc_id = self.upload(data, "mixed.pdf")
+        listed = self.client.get(f"/api/hidden/{doc_id}/0").get_json()["spans"]
+        texts = [s["text"] for s in listed]
+        self.assertIn("BURIED LINE HERE", texts, "the buried line should be found")
+        self.assertNotIn("ON TOP LINE HERE", texts, "the visible line must not be")
+
+        out = self.save(doc_id, [{
+            "page": 0, "rect": {"x0": 0.02, "y0": 0.10, "x1": 0.98, "y1": 0.60},
+            "replace": True, "text": "REPLACEMENT",
+        }])
+        patched = fitz.open(out["output_path"])
+        original = fitz.open("pdf", data)
+        try:
+            text = patched[0].get_text("text")
+            self.assertNotIn("BURIED LINE HERE", text, "buried line should be gone")
+            self.assertIn("ON TOP LINE HERE", text, "visible line must survive")
+            self.assertEqual(
+                original[0].get_pixmap(dpi=110).tobytes("png"),
+                patched[0].get_pixmap(dpi=110).tobytes("png"))
+        finally:
+            patched.close()
+            original.close()
 
 
 class TestDeleteOnlyBoxes(Base):

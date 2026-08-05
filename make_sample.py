@@ -63,12 +63,37 @@ PAGES = [
         ],
         # Invisible, deliberately garbled text sitting over the image above -
         # what a real scanner's OCR pass leaves behind when it misreads.
+        "bad_ocr_under_image": False,
         "bad_ocr": [
             "5TAT1ON ZZ - OUTFL0W REA D1NGS",
             "",
             "F1ow ra7e ......... Z14.9 1/m1n",
             "Turb1d1ty ........ l.Z NTU",
             "5amp1e 1D ........ QF-348O-<",
+        ],
+    },
+    {
+        "title": "Quarterly Field Report - Page 4",
+        "text_layer": [
+            "Page 4 hides its bad OCR text a different way: the text is ordinary",
+            "black text, but it is painted BEFORE the image, so the picture covers",
+            "it completely. Nobody can see it, yet it is not 'invisible' text.",
+        ],
+        "image_only": [
+            "STATION 31 - RESERVOIR READINGS",
+            "",
+            "Flow rate ......... 88.1 L/min",
+            "Turbidity ........ 4.6 NTU",
+            "Sample ID ........ QF-5017-D",
+        ],
+        # Same garbled text, but drawn first and then buried under the image.
+        "bad_ocr_under_image": True,
+        "bad_ocr": [
+            "5TAT1ON 3l - RE5ERV01R READ1NG5",
+            "",
+            "F1ow ra7e ......... 88.l 1/m1n",
+            "Turb1d1ty ........ 4.6 NTU",
+            "5amp1e 1D ........ QF-5Ol7-D",
         ],
     },
 ]
@@ -118,18 +143,32 @@ def main() -> None:
             y += 16
 
         block = fitz.Rect(MARGIN, y + 18, PAGE_W - MARGIN, y + 18 + 175)
+        buried = spec.get("bad_ocr_under_image", False)
+
+        def draw_bad_ocr() -> None:
+            """
+            The wrong OCR layer, laid out to match the picture like real output.
+
+            Drawn either in render mode 3 over the image, or as plain black text
+            *before* the image so the picture buries it - two different ways real
+            tools hide an OCR layer.
+            """
+            for i, line in enumerate(spec.get("bad_ocr", [])):
+                if not line:
+                    continue
+                page.insert_text(
+                    fitz.Point(block.x0 + 20, block.y0 + 26 + 17 * i),
+                    line, fontname="cour", fontsize=10.5,
+                    render_mode=0 if buried else 3,
+                )
+
+        if buried:
+            draw_bad_ocr()
+
         page.insert_image(block, stream=_render_block(spec["image_only"],
                                                       block.width, block.height))
-
-        # A wrong invisible text layer over the image, matching how the block
-        # was laid out, so it lines up with the picture like real OCR output.
-        for i, line in enumerate(spec.get("bad_ocr", [])):
-            if not line:
-                continue
-            page.insert_text(
-                fitz.Point(block.x0 + 20, block.y0 + 26 + 17 * i),
-                line, fontname="cour", fontsize=10.5, render_mode=3,
-            )
+        if not buried:
+            draw_bad_ocr()
 
         note_y = block.y1 + 26
         page.insert_text(
