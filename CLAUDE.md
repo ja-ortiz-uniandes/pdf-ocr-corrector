@@ -107,16 +107,27 @@ whether the hidden layer goes.
 The awkward part: `apply_redactions()` has **no render-mode filter** — it deletes every glyph meeting the
 rectangle. Which rectangles get handed to it *is* the safety mechanism.
 
-`_is_hidden()` decides what counts as an OCR layer rather than content. Real files use several shapes and
+`_hidden_kind()` decides what counts as an OCR layer rather than content. Real files use several shapes and
 missing one makes deletion look broken:
 
 | shape | `get_texttrace()` reports | treated as |
 | --- | --- | --- |
-| render mode 3 | `type` 3 | hidden |
-| zero opacity | `opacity` 0 | hidden |
-| white fill (old OCR tools) | `type` 0, `color` ≈ (1,1,1) | hidden |
+| render mode 3 | `type` 3 | hidden (`invisible`) |
+| zero opacity | `opacity` 0 | hidden (`transparent`) |
+| white fill (old OCR tools) | `type` 0, `color` ≈ (1,1,1) | hidden (`white`) |
+| painted before the scan image | `type` 0, plain black — **indistinguishable from content** | hidden (`behind image`), decided by experiment |
 | clip-only, render mode 7 | **nothing at all** — the span is absent | hidden, but only reachable via the selection rect |
 | modes 4/5/6 (clip + paint) | `type` 0 or 1 | visible |
+
+**Burial is decided by rendering, not by draw order.** Some tools write the OCR text first and paint the
+scan over it; the text is ordinary black text that nobody can see. Do not try to settle this from
+`get_texttrace()["seqno"]` versus `get_image_info()["number"]` — they are *different sequences* (in the
+sample's page 4 the image's real slot is 8, the gap in the span seqnos, while `number` reports 6). Instead
+`_buried_candidates()` finds spans lying ≥90% inside an image rect and `_burial_confirmed()` clears them on
+a throwaway copy of the file, comparing renders of just that area. The group is tested at once (the common
+scan case); if that fails, spans are probed individually, capped at `MAX_BURIAL_PROBES`. Confirmed spans
+are passed around as a set of `seqno` values (`buried`) that `_region_text`, `_visible_boxes` and
+`_clearable_rects` all accept.
 
 `_clearable_rects()` then plans the deletion:
 
@@ -194,6 +205,14 @@ would silently delete the existing layer. Reported separately as `boxes_deleted_
 `output/<stem>_ocr-fixed.pdf`, and `boxes.json` (provenance of the last save). `doc_id` is a 32-char hex
 UUID and `_doc_dir()` validates it character by character — that check is what keeps path traversal out
 of the work directory, so keep it if you refactor.
+
+### Caching
+
+`_no_cache()` sends `no-store` for `/`, `/api/*` and **`/static/*`**. A browser holding a stale `app.js`
+after an update is indistinguishable from a broken feature, and there is nothing to gain from caching a
+local file. `/api/page/*` is exempt: renders are large and immutable per (page, dpi), so that route sets its
+own header. The frontend also guards `el.showhidden` for null, so a stale `index.html` degrades to "no
+outlines" instead of throwing and taking the whole script down.
 
 ### Frontend
 

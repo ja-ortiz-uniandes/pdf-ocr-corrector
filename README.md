@@ -137,9 +137,11 @@ To stop the app: press `Ctrl+C` in the console window, or just close it.
 
 A PDF text object carries a render mode that decides whether it paints ink:
 
-- **Hidden text** (render mode 3) — what a scanner's OCR pass writes over the page
-  image. You never see it; it exists so the scan can be searched. When the OCR was
-  wrong, this is the text you want gone.
+- **Hidden text** — what a scanner's OCR pass writes over the page image. You never
+  see it; it exists so the scan can be searched. When the OCR was wrong, this is
+  the text you want gone. Usually it is marked invisible (render mode 3), but it can
+  also be transparent, white-on-white, or plain black text painted *before* the
+  scan image so the picture buries it — the app handles all four.
 - **Visible text** — real, drawn words: a born-digital PDF, or a caption. This *is*
   the page.
 
@@ -205,14 +207,22 @@ hidden or visible. Handled shapes:
 
 | shape | how it appears | handled |
 | --- | --- | --- |
-| render mode 3 | `HIDDEN mode=3` | yes — the standard OCR layer |
-| zero opacity | `HIDDEN opacity=0.0` | yes |
-| white fill | `HIDDEN mode=0 colour=(1.0, 1.0, 1.0)` | yes — what older OCR tools used |
+| render mode 3 | `HIDDEN[invisible]` | yes — the standard OCR layer |
+| zero opacity | `HIDDEN[transparent]` | yes |
+| white fill | `HIDDEN[white]` | yes — what older OCR tools used |
+| painted before the scan image | `HIDDEN[behind image]` — ordinary black text that the picture covers | yes |
 | clip-only (mode 7) | not listed at all; the tool prints a NOTE about untraceable characters | yes, via the selection rectangle, but only where the area has no visible text |
+
+The fourth case is worth knowing about: some tools write the OCR text *first* and
+then paint the scan on top, so the text is plain black yet nobody can ever see it.
+Nothing about the text itself gives that away, so the app settles it by experiment
+— it clears the candidates on a throwaway copy and checks whether the render
+changes. If it does not, the text really was buried and can go.
 
 If a span shows as `visible` but you know it is not drawn on the page, that is a
 classification gap — the appearance guard will refuse to delete it, so nothing
-breaks, but it will not be removed either.
+breaks, but it will not be removed either. Send that `--modes` output along if you
+hit it.
 
 Regardless of these settings, every crop is upscaled if small, contrast-
 normalised and unsharp-masked before OCR.
@@ -249,7 +259,7 @@ image with no text behind it:
 .venv/bin/python make_sample.py
 ```
 
-That writes `samples/sample_missing_ocr.pdf` — three pages:
+That writes `samples/sample_missing_ocr.pdf` — four pages:
 
 - **Pages 1-2**: a real text layer plus a grey block that is a flattened image
   with no text behind it. Tests the "missing text" case.
@@ -280,7 +290,7 @@ unfindable, and confirm the page still looks unchanged.
 .venv/bin/python -m unittest test_app
 ```
 
-56 tests covering the parts that can fail silently: text lands inside the box you
+63 tests covering the parts that can fail silently: text lands inside the box you
 drew, it is written in invisible render mode, the rendered page stays
 byte-identical to the original, the source file is never modified, deleting a
 hidden OCR layer removes it without changing a pixel, a partly covered hidden line
