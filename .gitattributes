@@ -1,0 +1,11 @@
+# Keep the shell launchers LF-only: CRLF makes them fail on macOS/Linux with
+# "bad interpreter: /usr/bin/env bash^M". The Windows launcher wants CRLF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.command text eol=lf
+*.bat text eol=crlf
+
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary
