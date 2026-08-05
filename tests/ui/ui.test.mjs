@@ -67,15 +67,15 @@ window.fetch = async (url, opts = {}) => {
     case '/api/ocr':
       return json({
         text: OCR_TEXT,
-        existing_text: 'W5O62 l84 (wrong OCR layer)',
-        existing_visible: false,
+        existing_invisible_text: 'W5O62 l84 (wrong OCR layer)',
+        existing_visible_text: 'a visible caption',
         crop_size: [100, 40],
         preview: 'data:image/png;base64,AAAA',
       });
     case '/api/save':
       return json({
         boxes_applied: 1, lines_written: 1, unsupported_chars: [],
-        chars_removed: 27, visible_text_removed: false,
+        chars_removed: 27, glyphs_protected: 3,
         output_name: 'scan_ocr-fixed.pdf', download_url: '/api/download/x',
       });
     default:
@@ -139,13 +139,17 @@ await tick(40);   // the second region's OCR lands mid-typing
 ok(doc.activeElement === doc.querySelector('.card textarea'), 'caret stays in region 1');
 ok(doc.querySelector('.card textarea').selectionStart === 6, 'caret offset preserved');
 
-group('replacing existing text is opt-out per region');
+group('deleting the old OCR text is opt-out per region');
 const firstCard = doc.querySelector('.card');
 const replaceBox = firstCard.querySelector('.note-check input');
-ok(!!replaceBox, 'a per-region "delete existing text" checkbox appears when the area has text');
+ok(!!replaceBox, 'a per-region "delete old OCR text" checkbox appears when hidden text exists');
 ok(replaceBox.checked, 'it defaults to on, following the global setting');
-ok(!firstCard.querySelector('.note').classList.contains('warn'),
-  'an invisible existing layer is not flagged as dangerous');
+const notes = [...firstCard.querySelectorAll('.note')].map((n) => n.textContent).join(' | ');
+ok(/invisible, so deleting it changes nothing/.test(notes),
+  'the hidden layer is described as safe to delete');
+ok(/visible text, which is always kept/.test(notes),
+  'visible text in the same region is reported as kept, not as a hazard');
+ok(!firstCard.querySelector('.note.warn'), 'no scare styling: nothing here is destructive');
 replaceBox.checked = false;
 replaceBox.dispatchEvent(new window.Event('change', { bubbles: true }));
 
@@ -162,8 +166,10 @@ ok(payload.doc_id === 'a'.repeat(32), 'doc id passed through');
 ok(payload.replace_existing === true, 'global replace setting sent');
 ok(payload.boxes[0].replace === false, 'region 1 opted out of replacement');
 ok(payload.boxes[1].replace === true, 'region 2 kept the default');
-ok(doc.getElementById('banner').textContent.includes('27 character'),
-  'save banner reports how much old text was removed');
+const banner = doc.getElementById('banner').textContent;
+ok(banner.includes('27 character'), 'save banner reports how much old text was deleted');
+ok(/invisible only/.test(banner), 'banner makes clear only hidden text was touched');
+ok(/3 hidden character\(s\) were kept/.test(banner), 'protected glyphs are reported');
 
 group('deleting a region');
 doc.querySelector('.card-head .del').click();

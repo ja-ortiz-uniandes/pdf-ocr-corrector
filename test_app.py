@@ -383,9 +383,9 @@ class TestReplaceExistingText(Base):
             self.assertEqual(doc.page_count, 3)
             page = doc[self.BAD_PAGE]
             rect = A._rect_from_norm(page, self.BAD_BLOCK)
-            text, visible = A._region_text(page, rect)
-            self.assertIn("QF-348O-<", text, "garbled OCR text should be present")
-            self.assertFalse(visible, "the bad layer must be invisible")
+            visible, invisible = A._region_text(page, rect)
+            self.assertIn("QF-348O-<", invisible, "garbled OCR text should be present")
+            self.assertEqual(visible, "", "the block itself has no visible text")
         finally:
             doc.close()
 
@@ -397,7 +397,6 @@ class TestReplaceExistingText(Base):
                     "Turbidity 1.2 NTU\nSample ID QF-3480-C",
         }])
         self.assertGreater(out["chars_removed"], 0)
-        self.assertFalse(out["visible_text_removed"], "nothing visible should have gone")
 
         doc = fitz.open(out["output_path"])
         try:
@@ -456,29 +455,92 @@ class TestReplaceExistingText(Base):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.get_json()["chars_removed"], 0)
 
-    def test_visible_text_removal_is_reported(self):
+    def test_visible_text_is_never_deleted(self):
+        """Boxing an area of real, drawn text must not erase a single word."""
         doc_id = self.upload(SAMPLE.read_bytes())
         out = self.save(doc_id, [{
-            "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "NEW VISIBLE AREA TEXT",
+            "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "NEW TEXT ON TOP",
         }])
-        self.assertTrue(out["visible_text_removed"],
-                        "removing visible text must be reported back")
-        self.assertGreater(out["chars_removed"], 0)
+        self.assertEqual(out["chars_removed"], 0, "visible text must not be removed")
+
+        original = fitz.open(SAMPLE)
+        patched = fitz.open(out["output_path"])
+        try:
+            text = patched[0].get_text("text")
+            self.assertIn("This paragraph has a proper text layer.", text)
+            self.assertIn("search it, and copy it out of the PDF", text)
+            self.assertIn("NEW TEXT ON TOP", text)
+            self.assertEqual(
+                original[0].get_pixmap(dpi=110).tobytes("png"),
+                patched[0].get_pixmap(dpi=110).tobytes("png"),
+                "the page must still look identical",
+            )
+        finally:
+            original.close()
+            patched.close()
+
+    def test_whole_page_box_keeps_all_visible_text(self):
+        """The blunt case: select everything, and only hidden OCR text goes."""
+        doc_id = self.upload(SAMPLE.read_bytes())
+        out = self.save(doc_id, [{
+            "page": self.BAD_PAGE, "rect": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+            "replace": True, "text": "WHOLE PAGE REPLACEMENT",
+        }])
+        doc = fitz.open(out["output_path"])
+        try:
+            text = doc[self.BAD_PAGE].get_text("text")
+            self.assertIn("Quarterly Field Report - Page 3", text, "title must survive")
+            self.assertIn("throw the bad text away.", text, "body must survive")
+            self.assertIn("(The grey block above is an image.", text, "caption must survive")
+            self.assertNotIn("QF-348O-<", text, "hidden bad OCR text should be gone")
+            self.assertIn("WHOLE PAGE REPLACEMENT", text)
+        finally:
+            doc.close()
 
     def test_removal_is_per_glyph_not_per_line(self):
-        """A box over half a line must leave the other half in place."""
+        """A box over half a hidden line must leave the other half in place."""
         doc_id = self.upload(SAMPLE.read_bytes())
         out = self.save(doc_id, [{
-            "page": 0, "rect": {"x0": 0.05, "y0": 0.115, "x1": 0.45, "y1": 0.165},
+            "page": self.BAD_PAGE,
+            "rect": {"x0": 0.094, "y0": 0.200, "x1": 0.30, "y1": 0.400},
             "replace": True, "text": "PARTIAL",
         }])
         doc = fitz.open(out["output_path"])
         try:
-            text = doc[0].get_text("text")
-            self.assertIn("already select it,", text, "right-hand remainder should survive")
-            self.assertNotIn("This paragraph has a proper", text, "left side should be gone")
+            text = doc[self.BAD_PAGE].get_text("text")
+            self.assertNotIn("5amp1e", text, "left-hand glyphs should be gone")
+            self.assertIn("QF-348O-<", text, "right-hand remainder should survive")
         finally:
             doc.close()
+
+    def test_invisible_glyphs_under_visible_text_are_protected(self):
+        """
+        A hidden glyph sitting under real ink cannot be redacted without taking
+        the ink too, so it is reported as protected instead.
+        """
+        doc = fitz.open(SAMPLE)
+        page = doc[0]
+        # Lay hidden text on exactly the baseline of page 1's first visible
+        # paragraph line (y = MARGIN + 44 in make_sample.py), so the glyph boxes
+        # genuinely overlap real ink.
+        page.insert_text(fitz.Point(56, 100), "ghost text over real words",
+                         fontname="helv", fontsize=11, render_mode=3)
+        data = doc.tobytes()
+        doc.close()
+
+        doc_id = self.upload(data, "overlap.pdf")
+        out = self.save(doc_id, [{
+            "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "SAFE",
+        }])
+        self.assertGreater(out["glyphs_protected"], 0,
+                           "overlapping hidden glyphs should be reported as protected")
+
+        patched = fitz.open(out["output_path"])
+        try:
+            self.assertIn("This paragraph has a proper text layer.",
+                          patched[0].get_text("text"), "visible words must survive")
+        finally:
+            patched.close()
 
     def test_multiple_boxes_on_one_page_all_get_cleared(self):
         doc_id = self.upload(SAMPLE.read_bytes())
@@ -526,18 +588,41 @@ class TestReplaceExistingText(Base):
                 finally:
                     doc.close()
 
-    def test_region_text_flags_visible_and_invisible(self):
+    def test_region_text_separates_visible_from_invisible(self):
         doc = fitz.open(SAMPLE)
         try:
             visible_rect = A._rect_from_norm(doc[0], self.VISIBLE_AREA)
-            text, visible = A._region_text(doc[0], visible_rect)
-            self.assertIn("This paragraph", text)
-            self.assertTrue(visible)
+            visible, invisible = A._region_text(doc[0], visible_rect)
+            self.assertIn("This paragraph", visible)
+            self.assertEqual(invisible, "")
+
+            block = A._rect_from_norm(doc[self.BAD_PAGE], self.BAD_BLOCK)
+            visible, invisible = A._region_text(doc[self.BAD_PAGE], block)
+            self.assertIn("Turb1d1ty", invisible)
+            self.assertEqual(visible, "")
 
             empty_rect = A._rect_from_norm(doc[0], {"x0": 0.05, "y0": 0.75, "x1": 0.4, "y1": 0.8})
-            self.assertEqual(A._region_text(doc[0], empty_rect), ("", False))
+            self.assertEqual(A._region_text(doc[0], empty_rect), ("", ""))
         finally:
             doc.close()
+
+    def test_ocr_reports_both_kinds_of_existing_text(self):
+        if not A._tesseract_info()["available"]:
+            self.skipTest("Tesseract is not installed")
+        doc_id = self.upload(SAMPLE.read_bytes())
+
+        res = self.client.post("/api/ocr", json={
+            "doc_id": doc_id, "page": self.BAD_PAGE, "rect": self.BAD_BLOCK, "psm": 6})
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertIn("QF-348O-<", body["existing_invisible_text"])
+        self.assertEqual(body["existing_visible_text"], "")
+
+        res = self.client.post("/api/ocr", json={
+            "doc_id": doc_id, "page": 0, "rect": self.VISIBLE_AREA, "psm": 6})
+        body = res.get_json()
+        self.assertIn("This paragraph", body["existing_visible_text"])
+        self.assertEqual(body["existing_invisible_text"], "")
 
 
 class TestSanitize(unittest.TestCase):
@@ -590,7 +675,8 @@ class TestOcr(Base):
     def test_reports_existing_text_in_region(self):
         doc_id = self.upload(SAMPLE.read_bytes())
         out = self.ocr(doc_id, {"x0": 0.05, "y0": 0.05, "x1": 0.95, "y1": 0.20})
-        self.assertIn("Quarterly Field Report", out["existing_text"])
+        self.assertIn("Quarterly Field Report", out["existing_visible_text"])
+        self.assertEqual(out["existing_invisible_text"], "")
 
     def test_preprocessing_flags_accepted(self):
         doc_id = self.upload(SAMPLE.read_bytes())
