@@ -173,6 +173,13 @@ Clicking an outline creates a region prefilled with that text, `replace` forced 
 correcting a misread word should not risk a fresh misread. `sourceText` links the region to the span so
 re-clicking selects instead of duplicating, and claimed outlines render `.used`.
 
+It deliberately does **not** focus the text field, which keeps `Delete` available as a global shortcut:
+`Delete` calls `markDeleteOnly()` on the selected region, `Shift+Delete` discards it. That makes clearing a
+bad layer a two-key loop (click outline, `Delete`) rather than a trip to the buttons. The keydown handler
+still bails while an input is focused, so `Delete` inside the field is ordinary text editing.
+`markDeleteOnly()` keeps `text` intact and only sets the flag, so the field can show it struck through and
+**Keep text** can undo it; the empty string is substituted at save time.
+
 Clip-only (mode 7) text cannot be outlined at all, so the response also carries `untraceable_chars`; the UI
 reports it rather than implying the page is clean.
 

@@ -116,8 +116,22 @@ To stop the app: press `Ctrl+C` in the console window, or just close it.
    right-hand panel, together with a preview of exactly what was sent to Tesseract.
 6. **Edit the text** in the box until it is correct. That edited text is what
    gets embedded — Tesseract's guess is only a starting point.
-7. Repeat for as many regions and pages as you need. `Delete` discards the
-   selected region; **Re-OCR** re-runs a box after you change the settings.
+7. Repeat for as many regions and pages as you need. **Re-OCR** re-runs a box after
+   you change the settings.
+
+   Keyboard, with a region selected and the text field not focused:
+
+   | key | effect |
+   | --- | --- |
+   | `Delete` | mark the region delete-only — drop its old text, write nothing |
+   | `Shift`+`Delete` | discard the region entirely, changing nothing in the PDF |
+   | `Esc` | deselect |
+   | `←` `→` / `PgUp` `PgDn` | change page |
+
+   Clicking an outline deliberately does **not** put the cursor in the text field,
+   so clearing a bad layer is: click outline, `Delete`, click next outline,
+   `Delete`. Click into the field when you want to edit the wording instead —
+   there `Delete` behaves as normal text editing.
 8. Click **Save PDF**. The corrected file downloads as
    `<original-name>_ocr-fixed.pdf` (also kept in
    `work/<id>/output/`).
@@ -180,8 +194,9 @@ about, because clicking one selects exactly that object.
 
 - **Fix a misread word** — click its outline, correct the prefilled text, save.
   Nothing is re-OCR'd, so nothing new can go wrong.
-- **Drop junk text** — click the outline, hit **Delete only**, save. The region
-  writes nothing and just removes that object.
+- **Drop junk text** — click the outline, press `Delete` (or hit **Delete only**),
+  save. The region writes nothing and just removes that object. The text stays
+  visible struck through, so **Keep text** puts it back if you change your mind.
 - **Re-OCR instead** — click the outline, then **Re-OCR** on the card if you would
   rather have Tesseract read that area afresh.
 
