@@ -497,21 +497,159 @@ class TestReplaceExistingText(Base):
         finally:
             doc.close()
 
-    def test_removal_is_per_glyph_not_per_line(self):
-        """A box over half a hidden line must leave the other half in place."""
+    def test_partly_covered_hidden_line_goes_entirely(self):
+        """
+        Selections never line up with the OCR layer's own boxes, so a line that is
+        clearly targeted must go whole rather than leaving a fragment behind.
+        """
         doc_id = self.upload(SAMPLE.read_bytes())
+        # Covers roughly the left quarter of the block: well past the 20% mark of
+        # each hidden line, but nowhere near their right-hand ends.
         out = self.save(doc_id, [{
             "page": self.BAD_PAGE,
             "rect": {"x0": 0.094, "y0": 0.200, "x1": 0.30, "y1": 0.400},
-            "replace": True, "text": "PARTIAL",
+            "replace": True, "text": "WHOLE LINES GONE",
         }])
         doc = fitz.open(out["output_path"])
         try:
             text = doc[self.BAD_PAGE].get_text("text")
-            self.assertNotIn("5amp1e", text, "left-hand glyphs should be gone")
-            self.assertIn("QF-348O-<", text, "right-hand remainder should survive")
+            for fragment in ("5amp1e", "QF-348O-<", "Turb1d1ty", "l.Z NTU",
+                             "F1ow ra7e", "Z14.9"):
+                self.assertNotIn(fragment, text,
+                                 f"{fragment!r} left behind - line not fully cleared")
+            self.assertIn("WHOLE LINES GONE", text)
         finally:
             doc.close()
+
+    def test_barely_touched_hidden_line_is_left_alone(self):
+        """Below the coverage threshold, a neighbouring line must not be dragged in."""
+        doc = fitz.open(SAMPLE)
+        try:
+            page = doc[self.BAD_PAGE]
+            spans = [s for s in page.get_texttrace()
+                     if A._is_hidden(s) and "QF-348O" in "".join(chr(c[0]) for c in s["chars"])]
+            self.assertEqual(len(spans), 1)
+            bbox = fitz.Rect(spans[0]["bbox"])
+            # Clip a 5% sliver off the left edge - under COVERAGE_TO_DELETE.
+            sliver = fitz.Rect(bbox.x0 - 2, bbox.y0, bbox.x0 + bbox.width * 0.05, bbox.y1)
+            rects, _ = A._clearable_rects(page, sliver, A._visible_boxes(page))
+            for rect in rects:
+                self.assertFalse(
+                    rect.contains(bbox),
+                    "a 5% overlap should not schedule the whole line for deletion")
+        finally:
+            doc.close()
+
+    def test_coverage_threshold_boundary(self):
+        """Just over the threshold deletes the line; just under leaves it."""
+        doc = fitz.open(SAMPLE)
+        try:
+            page = doc[self.BAD_PAGE]
+            visible = A._visible_boxes(page)
+            span = next(s for s in page.get_texttrace()
+                        if A._is_hidden(s) and "QF-348O" in "".join(chr(c[0]) for c in s["chars"]))
+            bbox = fitz.Rect(span["bbox"])
+
+            def schedules_whole_line(fraction):
+                sel = fitz.Rect(bbox.x0, bbox.y0, bbox.x0 + bbox.width * fraction, bbox.y1)
+                rects, _ = A._clearable_rects(page, sel, visible)
+                return any(r.contains(bbox) for r in rects)
+
+            self.assertFalse(schedules_whole_line(0.10), "10% should not delete the line")
+            self.assertTrue(schedules_whole_line(0.30), "30% should delete the line")
+        finally:
+            doc.close()
+
+    def test_hidden_text_shapes_are_all_recognised(self):
+        """Mode 3 is the common case, but zero opacity and white fill also hide text."""
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 100), "mode three", fontname="helv", fontsize=11, render_mode=3)
+        page.insert_text((72, 130), "white fill", fontname="helv", fontsize=11, color=(1, 1, 1))
+        page.insert_text((72, 160), "real ink", fontname="helv", fontsize=11)
+        try:
+            kinds = {}
+            for span in page.get_texttrace():
+                text = "".join(chr(c[0]) for c in span["chars"]).strip()
+                kinds[text] = A._is_hidden(span)
+            self.assertTrue(kinds.get("mode three"), "render mode 3 is hidden")
+            self.assertTrue(kinds.get("white fill"), "white-filled text is hidden")
+            self.assertFalse(kinds.get("real ink"), "black text is visible")
+        finally:
+            doc.close()
+
+    def test_clip_only_text_is_cleared_via_the_selection(self):
+        """
+        Render mode 7 paints nothing and does not appear in get_texttrace() at all,
+        so it can only be cleared through the selection rectangle. That is allowed
+        because the area holds no visible text.
+        """
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.draw_rect(fitz.Rect(50, 200, 500, 300), fill=(0.9, 0.9, 0.88))
+        page.insert_text((60, 260), "cl1p m0de junk 0CR", fontname="helv",
+                         fontsize=12, render_mode=7)
+        data = doc.tobytes()
+        doc.close()
+
+        probe = fitz.open("pdf", data)
+        try:
+            self.assertIn("cl1p m0de junk 0CR", probe[0].get_text("text"),
+                          "clip-mode text should still extract")
+            self.assertEqual(
+                [s for s in probe[0].get_texttrace()], [],
+                "clip-mode text is invisible to get_texttrace - the reason for the "
+                "selection-rectangle fallback")
+        finally:
+            probe.close()
+
+        doc_id = self.upload(data, "clipmode.pdf")
+        out = self.save(doc_id, [{
+            "page": 0, "rect": {"x0": 0.05, "y0": 0.20, "x1": 0.90, "y1": 0.40},
+            "replace": True, "text": "clip mode junk OCR",
+        }])
+        patched = fitz.open(out["output_path"])
+        try:
+            text = patched[0].get_text("text")
+            self.assertNotIn("cl1p m0de junk 0CR", text, "clip-mode text survived")
+            self.assertIn("clip mode junk OCR", text)
+        finally:
+            patched.close()
+
+    def test_appearance_guard_refuses_a_damaging_deletion(self):
+        """
+        Last line of defence: if clearing changed the render for any reason, the
+        page is restored and the save reports it instead of shipping lost words.
+        """
+        doc_id = self.upload(SAMPLE.read_bytes())
+        original_visible = A._visible_boxes  # force a misclassification
+        try:
+            A._visible_boxes = lambda page: []
+            out = self.save(doc_id, [{
+                "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "SHOULD NOT DAMAGE",
+            }])
+        finally:
+            A._visible_boxes = original_visible
+
+        self.assertEqual(out["pages_appearance_guarded"], 1,
+                         "the guard should have caught the damage")
+        self.assertEqual(out["chars_removed"], 0)
+
+        original = fitz.open(SAMPLE)
+        patched = fitz.open(out["output_path"])
+        try:
+            self.assertIn("This paragraph has a proper text layer.",
+                          patched[0].get_text("text"), "visible words must be restored")
+            self.assertEqual(
+                original[0].get_pixmap(dpi=110).tobytes("png"),
+                patched[0].get_pixmap(dpi=110).tobytes("png"),
+                "the restored page must render identically",
+            )
+            self.assertIn("SHOULD NOT DAMAGE", patched[0].get_text("text"),
+                          "the correction itself should still be applied")
+        finally:
+            original.close()
+            patched.close()
 
     def test_invisible_glyphs_under_visible_text_are_protected(self):
         """
@@ -532,8 +670,8 @@ class TestReplaceExistingText(Base):
         out = self.save(doc_id, [{
             "page": 0, "rect": self.VISIBLE_AREA, "replace": True, "text": "SAFE",
         }])
-        self.assertGreater(out["glyphs_protected"], 0,
-                           "overlapping hidden glyphs should be reported as protected")
+        self.assertGreater(out["lines_protected"], 0,
+                           "hidden lines overlapping ink should be reported as protected")
 
         patched = fitz.open(out["output_path"])
         try:

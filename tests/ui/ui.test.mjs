@@ -75,7 +75,7 @@ window.fetch = async (url, opts = {}) => {
     case '/api/save':
       return json({
         boxes_applied: 1, lines_written: 1, unsupported_chars: [],
-        chars_removed: 27, glyphs_protected: 3,
+        chars_removed: 27, lines_protected: 3, pages_appearance_guarded: 1,
         output_name: 'scan_ocr-fixed.pdf', download_url: '/api/download/x',
       });
     default:
@@ -168,8 +168,10 @@ ok(payload.boxes[0].replace === false, 'region 1 opted out of replacement');
 ok(payload.boxes[1].replace === true, 'region 2 kept the default');
 const banner = doc.getElementById('banner').textContent;
 ok(banner.includes('27 character'), 'save banner reports how much old text was deleted');
-ok(/invisible only/.test(banner), 'banner makes clear only hidden text was touched');
-ok(/3 hidden character\(s\) were kept/.test(banner), 'protected glyphs are reported');
+ok(/page still looks the same/.test(banner), 'banner states the page is unchanged');
+ok(/3 hidden line\(s\) were kept/.test(banner), 'protected lines are reported');
+ok(/would have changed how the page looks/.test(banner),
+  'appearance-guarded pages are reported rather than silently shipped');
 
 group('deleting a region');
 doc.querySelector('.card-head .del').click();
