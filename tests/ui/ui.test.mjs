@@ -246,7 +246,54 @@ ok(doc.querySelectorAll('.card').length === 2, 'the drag drew a second region');
 ok(calls.filter((c) => c.url === '/api/ocr').length > ocrCallsBefore,
   'and that one did run OCR');
 
-group('delete-only regions');
+group('Delete key marks the selected region for deletion');
+const key = (k, opts = {}) => doc.dispatchEvent(
+  new window.KeyboardEvent('keydown', { key: k, bubbles: true, ...opts }));
+
+// Pick up a fresh outline; focus must stay off the text field so Delete is free.
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+pointer('pointerdown', outlines()[0], 200, 260);
+pointer('pointerup', overlay, 200, 260);
+await tick(10);
+ok(doc.activeElement !== doc.querySelector('.card textarea'),
+  'clicking an outline does not focus the field, leaving Delete usable');
+
+key('Delete');
+await tick(10);
+let marked = doc.querySelector('.card');
+ok(marked.classList.contains('delonly'), 'Delete marked the region as delete-only');
+ok(marked.querySelector('textarea').disabled, 'its field is disabled');
+ok(doc.querySelectorAll('.card').length === 1, 'the region itself is kept');
+ok(marked.querySelector('textarea').value === HIDDEN_SPANS[0].text,
+  'the text is kept for reference, so the decision is reversible');
+
+key('Delete');
+await tick(10);
+ok(doc.querySelectorAll('.card').length === 1, 'pressing Delete again is harmless');
+
+group('Shift+Delete discards the region entirely');
+key('Delete', { shiftKey: true });
+await tick(10);
+ok(doc.querySelectorAll('.card').length === 0, 'the region is gone');
+ok(!doc.querySelector('.hx.used'), 'and its outline is available again');
+
+group('Delete inside the text field still edits text');
+pointer('pointerdown', outlines()[0], 200, 260);
+pointer('pointerup', overlay, 200, 260);
+await tick(10);
+const editing = doc.querySelector('.card textarea');
+editing.focus();
+key('Delete');
+await tick(10);
+ok(!doc.querySelector('.card').classList.contains('delonly'),
+  'typing in the field is not hijacked by the shortcut');
+
+group('delete-only regions reach the backend');
+// A second, ordinary region so the payload carries both kinds.
+window.addBox({ x0: 0.2, y0: 0.6, x1: 0.7, y1: 0.7 });
+await tick(30);
+ok(doc.querySelectorAll('.card').length === 2, 'two regions queued');
+
 const onlyBtn = [...doc.querySelectorAll('.card')[0].querySelectorAll('.card-head button')]
   .find((b) => b.textContent === 'Delete only');
 ok(!!onlyBtn, 'cards offer a "Delete only" action');
