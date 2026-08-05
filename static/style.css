@@ -263,6 +263,21 @@ main { flex: 1; display: flex; min-height: 0; }
   flex: 0 0 auto;
 }
 
+/* Narrow windows: side-by-side would squeeze the page viewer to zero width,
+   so stack the panel underneath instead. */
+@media (max-width: 900px) {
+  main { flex-direction: column; }
+  .viewer { flex: 1 1 45%; min-height: 220px; padding: 10px; }
+  .side {
+    width: auto;
+    flex: 1 1 55%;
+    border-left: none;
+    border-top: 1px solid var(--line);
+  }
+  .bar { flex-wrap: wrap; }
+  .docname { max-width: 18ch; }
+}
+
 .spin {
   display: inline-block;
   width: 11px;

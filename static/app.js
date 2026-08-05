@@ -299,8 +299,13 @@ async function runOcr(box, psmOverride) {
     status('OCR failed');
   } finally {
     box.busy = false;
+    const typingElsewhere = document.activeElement
+      && document.activeElement.tagName === 'TEXTAREA';
     drawBoxes();
     renderList();
+    // Editing the result is the next step, so put the caret there - unless the
+    // user is already typing in another region.
+    if (state.selected === box.id && !typingElsewhere) focusBox(box.id);
   }
 }
 
@@ -309,13 +314,27 @@ function indexOf(box) {
 }
 
 function select(id) {
+  if (state.selected === id) return;   // never rebuild for a no-op selection
   state.selected = id;
   drawBoxes();
-  renderList();
+  markSelection();
   if (id != null) {
     const card = el.boxlist.querySelector(`.card[data-id="${id}"]`);
     if (card) card.scrollIntoView({ block: 'nearest' });
   }
+}
+
+/* Selection changes only toggle classes. Rebuilding the card list here would
+   destroy the textarea the user just clicked, taking focus with it. */
+function markSelection() {
+  el.boxlist.querySelectorAll('.card').forEach((n) => {
+    n.classList.toggle('sel', Number(n.dataset.id) === state.selected);
+  });
+}
+
+function focusBox(id) {
+  const ta = el.boxlist.querySelector(`.card[data-id="${id}"] textarea`);
+  if (ta) ta.focus();
 }
 
 function removeBox(id) {
@@ -350,6 +369,22 @@ function drawBoxes() {
 }
 
 function renderList() {
+  // A rebuild throws away the live DOM, so remember where the caret was and
+  // put it back afterwards - OCR finishing on one box must not interrupt
+  // typing in another.
+  let caret = null;
+  const active = document.activeElement;
+  if (active && active.tagName === 'TEXTAREA') {
+    const card = active.closest('.card');
+    if (card) {
+      caret = {
+        id: Number(card.dataset.id),
+        start: active.selectionStart,
+        end: active.selectionEnd,
+      };
+    }
+  }
+
   if (!state.boxes.length) {
     el.boxlist.innerHTML = '<p class="muted pad">No regions yet. Drag a box on the page.</p>';
     el.save.disabled = true;
@@ -425,6 +460,14 @@ function renderList() {
     });
     el.boxlist.appendChild(card);
   });
+
+  if (caret) {
+    const ta = el.boxlist.querySelector(`.card[data-id="${caret.id}"] textarea`);
+    if (ta) {
+      ta.focus();
+      try { ta.setSelectionRange(caret.start, caret.end); } catch (_) { /* ignore */ }
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ save */
