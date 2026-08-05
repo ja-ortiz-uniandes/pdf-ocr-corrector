@@ -1,0 +1,12 @@
+.venv/
+venv/
+work/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+samples/*.pdf
+!samples/README.md
