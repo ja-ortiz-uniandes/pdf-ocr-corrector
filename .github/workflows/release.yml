@@ -31,15 +31,16 @@ jobs:
           **Windows, zero install:** download `pdf-ocr-corrector-windows-portable.zip` below, extract it
           anywhere, run `pdf-ocr-corrector.exe`. Tesseract is bundled - nothing else to install.
 
-          **macOS / Linux, or if you'd rather run from source:** download **Source code (zip)**, extract
-          it, then:
+          **macOS / Linux, or if you'd rather run from source:** this route needs Python 3.10+ and
+          Tesseract OCR already installed on your machine - see the README for install steps. Then
+          download **Source code (zip)**, extract it, and run the launcher for your OS:
 
           - **macOS:** double-click `start.command`
           - **Linux:** run `./start.sh`
           - **Windows (source route):** double-click `start.bat`
 
-          The launcher creates a `.venv` and installs dependencies on first run, then opens the app in
-          your browser. Needs Python 3.10+ and Tesseract OCR - see the README for install steps.
+          The launcher creates a `.venv` and installs Python *packages* on first run (not Python or
+          Tesseract themselves), then opens the app in your browser.
 
           EOF
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
