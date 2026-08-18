@@ -27,11 +27,23 @@ import pytesseract
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from PIL import Image, ImageFilter, ImageOps
 
-BASE_DIR = Path(__file__).resolve().parent
-WORK_DIR = BASE_DIR / "work"
-STATIC_DIR = BASE_DIR / "static"
+# Frozen (PyInstaller) builds split two directories that are identical when run from
+# source: BASE_DIR is where the executable lives, used for anything that must persist
+# across runs (work/); RESOURCE_DIR is where bundled read-only assets were extracted
+# to (sys._MEIPASS - a fresh temp dir per run for --onefile builds), used for anything
+# shipped inside the bundle (static/, VERSION, the vendored Tesseract).
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(sys._MEIPASS)
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = BASE_DIR
 
-VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+WORK_DIR = BASE_DIR / "work"
+STATIC_DIR = RESOURCE_DIR / "static"
+BUNDLED_TESSERACT = RESOURCE_DIR / "tesseract" / "tesseract.exe"
+
+VERSION = (RESOURCE_DIR / "VERSION").read_text(encoding="utf-8").strip()
 GITHUB_REPO = "ja-ortiz-uniandes/pdf-ocr-corrector"
 
 HOST = os.environ.get("PDFOCR_HOST", "127.0.0.1")
@@ -77,6 +89,9 @@ def _find_tesseract() -> str | None:
     explicit = os.environ.get("TESSERACT_CMD")
     if explicit and Path(explicit).exists():
         return explicit
+
+    if BUNDLED_TESSERACT.exists():
+        return str(BUNDLED_TESSERACT)
 
     found = shutil.which("tesseract")
     if found:

@@ -28,12 +28,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > /tmp/how-to-run.md <<'EOF'
-          No install needed beyond the source below - this is a local Python/Flask app, not a compiled
-          binary. Download **Source code (zip)**, extract it, then:
+          **Windows, zero install:** download `pdf-ocr-corrector-windows-portable.zip` below, extract it
+          anywhere, run `pdf-ocr-corrector.exe`. Tesseract is bundled - nothing else to install.
 
-          - **Windows:** double-click `start.bat`
+          **macOS / Linux, or if you'd rather run from source:** download **Source code (zip)**, extract
+          it, then:
+
           - **macOS:** double-click `start.command`
           - **Linux:** run `./start.sh`
+          - **Windows (source route):** double-click `start.bat`
 
           The launcher creates a `.venv` and installs dependencies on first run, then opens the app in
           your browser. Needs Python 3.10+ and Tesseract OCR - see the README for install steps.
@@ -41,3 +44,35 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
             --notes-file /tmp/how-to-run.md --generate-notes
+
+  build-windows:
+    needs: release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Vendor Tesseract
+        run: ./packaging/vendor_tesseract_windows.sh packaging/vendor/windows/tesseract
+
+      - name: Build with PyInstaller
+        run: pyinstaller --distpath packaging/dist --workpath packaging/build --noconfirm packaging/pdf-ocr-corrector.spec
+
+      - name: Zip the portable build
+        run: |
+          cd packaging/dist
+          7z a -tzip ../../pdf-ocr-corrector-windows-portable.zip pdf-ocr-corrector >/dev/null
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" pdf-ocr-corrector-windows-portable.zip

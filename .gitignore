@@ -12,3 +12,7 @@ Thumbs.db
 .vscode/
 samples/*.pdf
 !samples/README.md
+
+packaging/vendor/
+packaging/dist/
+packaging/build/
