@@ -286,6 +286,17 @@ public key>`, which appends it to `.agerecipients`, re-encrypts every tracked fi
 `git config --global diff.age.textconv cat` makes `git diff` show plaintext diffs instead of ciphertext
 noise (already set on this machine).
 
+**Swapping `.agerecipients` alone does not re-encrypt anything already committed.** `git-age`'s `clean`
+filter decrypts HEAD's blob, compares it to the working-tree plaintext, and if they match byte-for-byte
+it re-stages HEAD's *original ciphertext verbatim* rather than re-sealing to the current recipients -
+this is what keeps unrelated commits from being pure encryption-nonce noise, but it means replacing a
+recipient and then just running `git add` silently keeps the file encrypted to the *old* key. This
+already happened once: an identity was discarded and replaced, `.agerecipients` was updated, `git add
+TODO.md` reported the expected diff, and the commit still shipped ciphertext only the discarded key
+could open. After changing `.agerecipients` for any reason other than `add-recipient` (which handles
+this itself), run `git-age files re-encrypt` - it decrypts-and-reseals unconditionally, ignoring whether
+the plaintext changed, and commits the result itself.
+
 ## Git
 
 This repository lives under the `ja-ortiz-uniandes` GitHub account while the machine's default `gh`
