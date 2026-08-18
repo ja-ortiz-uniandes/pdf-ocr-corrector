@@ -305,6 +305,9 @@ must never be committed.
 
 ## TODO.md is encrypted at rest, transparently
 
+`TODO.md` is where outstanding, unimplemented work is tracked - check it for open tasks, and add to it
+instead of leaving TODOs only in conversation or commit messages.
+
 `TODO.md` reads and edits as plain text in the working tree; only the committed git blob is ciphertext.
 This is `git-age` (https://github.com/prskr/git-age) - a `git-crypt`-style clean/smudge filter, chosen
 over `git-crypt` itself because git-crypt has no working Windows distribution (no official Windows
