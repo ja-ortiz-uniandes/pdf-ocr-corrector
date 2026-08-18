@@ -249,6 +249,43 @@ platforms, and it fires after the server is listening. First-run dependency inst
 forces LF on `*.sh`/`*.command` (CRLF yields `bad interpreter: /usr/bin/env bash^M`) and CRLF on `*.bat`;
 both shell scripts are committed with the exec bit set.
 
+## Versioning and releases
+
+`VERSION` at the repo root is the single source of truth (`X.Y.Z`, no leading `v`). Bump it in the same
+commit as the change it belongs to, then tag that commit `vX.Y.Z` and push the tag — `.github/workflows/
+release.yml` fires on `v*.*.*` tags, checks the tag against `VERSION` (fails the run on drift), and
+publishes a GitHub Release with auto-generated notes. There is no separate "cut a release" step beyond
+tagging.
+
+`_check_update()` in `app.py` hits `GET /repos/<repo>/releases/latest` unauthenticated at startup and
+compares `tag_name` against `VERSION`; the result is cached once (`_UPDATE_INFO`) and served from
+`/api/health`, which the frontend turns into a banner. This degrades the same way `_tesseract_info()`
+does: any network failure, timeout, or non-200 (including the 404 GitHub returns for a private repo's
+releases without auth) is swallowed and just means no banner — never a startup failure. **The update
+banner is a no-op while the repo is private**; it only does anything once the repo is public, since a
+local-only tool shipping a token to read a private repo's releases isn't worth the risk.
+
+## TODO.md is encrypted at rest, transparently
+
+`TODO.md` reads and edits as plain text in the working tree; only the committed git blob is ciphertext.
+This is `git-age` (https://github.com/prskr/git-age) - a `git-crypt`-style clean/smudge filter, chosen
+over `git-crypt` itself because git-crypt has no working Windows distribution (no official Windows
+binary, its Chocolatey package is delisted, and the only build path is a full MSYS2 toolchain for one
+tool) and over plain SOPS because SOPS's encryption is non-deterministic, which makes a naive git filter
+show spurious changes on every commit (see upstream getsops/sops#1137, still open).
+
+`git age install` (run once per machine, writes to the *global* git config) registers the filters;
+`.gitattributes` marks which paths go through them (`TODO.md filter=age diff=age merge=age -text`);
+`.agerecipients` at the repo root lists the public key(s) allowed to decrypt, and is itself plaintext and
+committed. The matching private key lives in `%LOCALAPPDATA%\git-age\keys.txt` on each machine - never
+committed, never derivable from anything in the repo - and is backed up in Bitwarden as a Secure Note so
+it can be restored on a new device. Adding a second device's key: generate a key there
+(`git-age keys generate`), then from a device that already has access run `git-age add-recipient <new
+public key>`, which appends it to `.agerecipients`, re-encrypts every tracked file, and commits.
+
+`git config --global diff.age.textconv cat` makes `git diff` show plaintext diffs instead of ciphertext
+noise (already set on this machine).
+
 ## Git
 
 This repository lives under the `ja-ortiz-uniandes` GitHub account while the machine's default `gh`

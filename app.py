@@ -16,6 +16,8 @@ import socket
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 from pathlib import Path
@@ -28,6 +30,9 @@ from PIL import Image, ImageFilter, ImageOps
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "work"
 STATIC_DIR = BASE_DIR / "static"
+
+VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+GITHUB_REPO = "ja-ortiz-uniandes/pdf-ocr-corrector"
 
 HOST = os.environ.get("PDFOCR_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("PDFOCR_PORT", "8765"))
@@ -110,6 +115,47 @@ def _tesseract_info() -> dict:
     except Exception:
         langs = ["eng"]
     return {"available": True, "cmd": _TESS_CMD, "version": version, "langs": langs}
+
+
+# --------------------------------------------------------------------------- #
+# Update check
+# --------------------------------------------------------------------------- #
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    parts = []
+    for p in v.strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _check_update() -> dict:
+    """Best-effort check against GitHub's latest release.
+
+    Never raises and never blocks longer than the timeout below: this call sits
+    on the startup path, and a network hiccup must degrade to "no update found"
+    exactly like a missing Tesseract degrades rather than crashing the server.
+    GitHub's unauthenticated API 404s on a private repo's releases, so this is a
+    no-op while the repo stays private - same failure path as any other outage.
+    """
+    result = {"available": False, "latest": None, "url": None}
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "pdf-ocr-corrector"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.load(resp)
+        latest = str(data.get("tag_name") or "").strip()
+        if latest and _parse_version(latest) > _parse_version(VERSION):
+            result.update(available=True, latest=latest, url=data.get("html_url"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        pass
+    return result
+
+
+_UPDATE_INFO = {"available": False, "latest": None, "url": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -587,6 +633,8 @@ def health():
         "tesseract": _tesseract_info(),
         "pymupdf": fitz.__doc__.strip() if fitz.__doc__ else "",
         "work_dir": str(WORK_DIR),
+        "version": VERSION,
+        "update": _UPDATE_INFO,
     })
 
 
@@ -923,13 +971,15 @@ def _pick_port(host: str, preferred: int) -> int:
 
 
 def main() -> None:
+    global _UPDATE_INFO
     WORK_DIR.mkdir(exist_ok=True)
     port = _pick_port(HOST, DEFAULT_PORT)
     url = f"http://{HOST}:{port}"
 
     info = _tesseract_info()
+    _UPDATE_INFO = _check_update()
     print("=" * 66)
-    print("  PDF OCR Corrector  -  everything stays on this machine")
+    print(f"  PDF OCR Corrector  v{VERSION}  -  everything stays on this machine")
     print("=" * 66)
     if info["available"]:
         print(f"  Tesseract {info['version']}  ({info['cmd']})")
@@ -937,6 +987,9 @@ def main() -> None:
     else:
         print("  WARNING: Tesseract not found. Region OCR will not work until")
         print("           you install it (see README) or set TESSERACT_CMD.")
+    if _UPDATE_INFO["available"]:
+        print(f"  Update available: {_UPDATE_INFO['latest']} (you have v{VERSION})")
+        print(f"  {_UPDATE_INFO['url']}")
     print(f"  Serving  {url}")
     print("  Press Ctrl+C to stop.")
     print("=" * 66)

@@ -93,6 +93,10 @@ async function api(path, opts) {
       banner('Tesseract is not installed (or not on PATH), so region OCR will fail. '
         + 'See the README for install steps, then restart the app.', 'err');
     }
+    if (h.tesseract.available && h.update && h.update.available) {
+      banner(`Update available: ${h.update.latest} (you have v${h.version}). `
+        + `Get it: ${h.update.url}`, 'ok');
+    }
   } catch (err) {
     el.tessinfo.textContent = 'health check failed: ' + err.message;
   }

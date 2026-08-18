@@ -368,6 +368,8 @@ that folder is always safe.
 | `tests/ui/` | Optional jsdom tests for the frontend (needs Node.js) |
 | `start.bat`, `start.sh`, `start.command` | One-click setup + launch |
 | `requirements.txt` | Python dependencies |
+| `VERSION` | Current version; `.github/workflows/release.yml` publishes a GitHub Release when a matching `vX.Y.Z` tag is pushed |
+| `TODO.md`, `.agerecipients` | Maintainer's task list — encrypted at rest with [git-age](https://github.com/prskr/git-age), so `TODO.md` looks like ciphertext unless you have the private key; not needed to run or contribute to the app itself |
 
 Built with [PyMuPDF](https://pymupdf.readthedocs.io/) (rendering + text
 insertion), [pytesseract](https://github.com/madmaze/pytesseract) +

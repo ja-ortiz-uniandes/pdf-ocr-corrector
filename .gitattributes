@@ -9,3 +9,4 @@
 *.png binary
 *.jpg binary
 *.ico binary
+TODO.md filter=age diff=age merge=age -text
