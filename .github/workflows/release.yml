@@ -44,7 +44,7 @@ jobs:
 
           EOF
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/how-to-run.md --generate-notes
+            --notes-file /tmp/how-to-run.md --generate-notes --clobber
 
   build-windows:
     needs: release
@@ -76,4 +76,4 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" pdf-ocr-corrector-windows-portable.zip
+        run: gh release upload "$GITHUB_REF_NAME" pdf-ocr-corrector-windows-portable.zip --clobber
