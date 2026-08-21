@@ -139,7 +139,9 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .pagewrap img { display: block; width: 100%; height: auto; user-select: none; }
 
-.overlay { position: absolute; inset: 0; cursor: crosshair; }
+/* touch-action: none keeps a touch drag from turning into a scroll or pinch
+   halfway through, which fired pointercancel and abandoned the gesture. */
+.overlay { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
 
 .bx {
   position: absolute;

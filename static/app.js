@@ -35,6 +35,8 @@ const state = {
   saved: true,
   hidden: [],         // hidden text objects on the current page, from /api/hidden
   hiddenPage: null,   // which page state.hidden belongs to
+  hiddenDoc: null,    // which document state.hidden belongs to
+  hiddenCache: {},    // page -> spans, so paging back is instant and silent
   untraceable: 0,     // hidden chars that cannot be outlined (clip-mode text)
 };
 
@@ -136,6 +138,14 @@ async function loadPdf(file) {
     state.nextId = 1;
     state.saved = true;
     state.page = 0;
+    // Belongs to the document that was just replaced. Clearing hiddenPage also
+    // matters for showPage(0) below: its same-page guard would otherwise treat
+    // the new document's page 0 as the page already on screen.
+    state.hidden = [];
+    state.hiddenPage = null;
+    state.hiddenDoc = null;
+    state.hiddenCache = {};
+    state.untraceable = 0;
 
     el.docname.textContent = doc.filename;
     el.pagecount.textContent = doc.pages.length;
@@ -161,27 +171,53 @@ async function loadPdf(file) {
 function showPage(n) {
   if (!state.doc) return;
   n = Math.max(0, Math.min(state.doc.pages.length - 1, n));
+  el.pageno.value = n + 1;   // snap a typed out-of-range number back
+  // A no-op page change must stay a no-op. The clamp above turns Left on page 1
+  // (and any out-of-range page number) into "the page you are already on", and
+  // re-running the body from there re-fetched the render, dropped every hidden
+  // outline until /api/hidden answered again, and rebuilt the whole card list.
+  if (n === state.page && state.hiddenPage === n) return;
   state.page = n;
-  el.pageno.value = n + 1;
+  el.overlay.querySelectorAll('.ghost').forEach((g) => g.remove());   // backstop
   el.pageimg.src = `/api/page/${state.doc.doc_id}/${n}.png?dpi=${RENDER_DPI}`;
   el.prev.disabled = n === 0;
   el.next.disabled = n === state.doc.pages.length - 1;
   drawBoxes();
-  renderList();
+  // renderList() is deliberately not called here: nothing in a card depends on
+  // which page is being viewed, so rebuilding it only destroyed live textareas
+  // and scrolled the list back to the top.
   loadHidden(n);
 }
 
 /* ------------------------------------------------- existing hidden text */
 
 async function loadHidden(pageNo) {
-  state.hidden = [];
+  const docId = state.doc.doc_id;
   state.hiddenPage = pageNo;
+  state.hiddenDoc = docId;
+
+  // Outlines are positioned in the current page's coordinates, so keeping the
+  // previous page's on screen while waiting would put them in the wrong place.
+  // They are cached per page instead: only the first visit to a page can blink,
+  // and /api/hidden is slow enough on a scan (burial probes) for that to matter.
+  const cached = state.hiddenCache[pageNo];
+  state.hidden = cached ? cached.spans : [];
+  state.untraceable = cached ? cached.untraceable : 0;
   drawHidden();
+  if (cached) return;
+
   try {
     const out = await api(`/api/hidden/${state.doc.doc_id}/${pageNo}`);
-    if (state.hiddenPage !== pageNo) return;   // user paged away meanwhile
+    // Both halves matter: a new upload resets to page 0, so checking the page
+    // alone lets a reply about the *previous* document through, and clicking one
+    // of its outlines then writes the old file's text at the old file's
+    // coordinates into the new file.
+    if (state.hiddenPage !== pageNo || state.hiddenDoc !== docId) return;
     state.hidden = out.spans || [];
     state.untraceable = out.untraceable_chars || 0;
+    state.hiddenCache[pageNo] = {
+      spans: state.hidden, untraceable: state.untraceable,
+    };
     drawHidden();
     if (state.hidden.length || state.untraceable) {
       let msg = `${state.hidden.length} hidden text object(s) on this page`;
@@ -207,7 +243,8 @@ function drawHidden() {
     d.className = 'hx';
     d.dataset.hidden = i;
     // Grey out ones already claimed by a region, so it is obvious what is queued.
-    if (state.boxes.some((b) => b.page === state.page && b.sourceText === span.text)) {
+    if (state.boxes.some((b) => b.page === state.page
+        && b.sourceKey === spanKey(span))) {
       d.classList.add('used');
     }
     Object.assign(d.style, {
@@ -229,10 +266,18 @@ function drawHidden() {
 
 if (el.showhidden) el.showhidden.addEventListener('change', drawHidden);
 
+/* Identity of a hidden span. The backend's seqno when it has one, otherwise the
+   text plus its position - never the text alone, or two spans holding the same
+   string collapse onto one and the second becomes unreachable. */
+function spanKey(span) {
+  if (span.id != null) return 's' + span.id;
+  return [span.text, span.rect.x0.toFixed(4), span.rect.y0.toFixed(4)].join('|');
+}
+
 function addFromHidden(span) {
   // Already queued? Just select it instead of stacking duplicates.
   const existing = state.boxes.find(
-    (b) => b.page === state.page && b.sourceText === span.text);
+    (b) => b.page === state.page && b.sourceKey === spanKey(span));
   if (existing) {
     select(existing.id);
     return;
@@ -243,6 +288,7 @@ function addFromHidden(span) {
     rect: span.rect,
     text: span.text,           // prefilled: usually a typo fix, no OCR needed
     sourceText: span.text,
+    sourceKey: spanKey(span),
     busy: false,
     preview: null,
     existingInvisible: span.text,
@@ -301,10 +347,27 @@ el.pageimg.addEventListener('load', () => { if (state.doc) applyZoom(); });
 /* ------------------------------------------------------------------ drawing */
 
 let drag = null;
+/* Set while renderList() puts the caret back, so the textarea's focus listener
+   knows not to move the selection. */
+let restoringCaret = false;
+
+/* Drop a gesture: the ghost goes, and so does `drag` itself. A stale non-null
+   `drag` is the real damage, because the next plain click on the page would be
+   treated as the end of the abandoned drag and create a phantom region, which
+   then runs OCR and gets written on save. */
+function endDrag() {
+  if (!drag) return;
+  if (drag.ghost) drag.ghost.remove();
+  drag = null;
+}
+
+el.overlay.addEventListener('pointercancel', endDrag);
+el.overlay.addEventListener('lostpointercapture', endDrag);
 
 el.overlay.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !state.doc) return;
   if (e.target.closest('.bx')) return;   // clicking an existing box selects it
+  endDrag();   // a second pointer must not orphan the first gesture's ghost
   const onHidden = e.target.closest('.hx');
   const r = el.overlay.getBoundingClientRect();
   drag = {
@@ -340,9 +403,10 @@ el.overlay.addEventListener('pointerup', (e) => {
   const r = el.overlay.getBoundingClientRect();
   const rect = normRect(drag);
   const hiddenIndex = drag.hiddenIndex;
-  drag.ghost.remove();
-  drag = null;
-  el.overlay.releasePointerCapture(e.pointerId);
+  endDrag();
+  if (el.overlay.hasPointerCapture && el.overlay.hasPointerCapture(e.pointerId)) {
+    el.overlay.releasePointerCapture(e.pointerId);
+  }
   // Ignore accidental clicks / hairline drags.
   if ((rect.x1 - rect.x0) * r.width < 6 || (rect.y1 - rect.y0) * r.height < 6) {
     if (hiddenIndex != null && state.hidden[hiddenIndex]) {
@@ -382,6 +446,9 @@ function addBox(rect, psmOverride) {
     deleteOnly: false,
     fromHidden: false,
     sourceText: null,
+    sourceKey: null,
+    edited: false,
+    ocrText: '',
     err: null,
   };
   state.boxes.push(box);
@@ -412,11 +479,21 @@ async function runOcr(box, psmOverride) {
         invert: el.invert.checked,
       }),
     });
-    box.text = out.text || '';
+    // The field stays editable while OCR runs, so typing can beat the reply.
+    // Overwriting then threw the correction away; the raw result is kept on the
+    // box so "Re-OCR" can still surface it.
+    box.ocrText = out.text || '';
+    if (!box.edited) box.text = box.ocrText;
     box.preview = out.preview;
     box.existingInvisible = out.existing_invisible_text || '';
     box.existingVisible = out.existing_visible_text || '';
-    status(box.text ? `region #${indexOf(box)} read` : `region #${indexOf(box)}: nothing found`);
+    box.existingKept = out.existing_invisible_kept || '';
+    if (box.edited && box.ocrText && box.ocrText !== box.text) {
+      status(`region #${indexOf(box)} read, your text kept`);
+    } else {
+      status(box.text ? `region #${indexOf(box)} read`
+        : `region #${indexOf(box)}: nothing found`);
+    }
   } catch (err) {
     box.err = err.message;
     status('OCR failed');
@@ -591,8 +668,12 @@ function renderList() {
       : (b.deleteOnly ? 'old text will be deleted, nothing written'
         : 'text to embed at this box');
     ta.spellcheck = false;
-    ta.addEventListener('input', () => { b.text = ta.value; state.saved = false; });
-    ta.addEventListener('focus', () => select(b.id));
+    ta.addEventListener('input', () => {
+      b.text = ta.value;
+      b.edited = true;   // an OCR reply must not overwrite what was typed here
+      state.saved = false;
+    });
+    ta.addEventListener('focus', () => { if (!restoringCaret) select(b.id); });
     card.appendChild(ta);
 
     if (b.err) {
@@ -624,6 +705,16 @@ function renderList() {
         wrap.appendChild(detail);
         card.appendChild(wrap);
       }
+      if (b.existingKept) {
+        // Hidden text the selection only clips: the backend leaves it alone, so
+        // the card has to say so rather than implying the checkbox covers it.
+        const note = document.createElement('div');
+        note.className = 'note';
+        note.textContent = 'Hidden text just outside this region is left as it is: '
+          + trim(b.existingKept, 70)
+          + ' - draw a box over it if it needs correcting too.';
+        card.appendChild(note);
+      }
       if (b.existingVisible) {
         const note = document.createElement('div');
         note.className = 'note';
@@ -643,8 +734,19 @@ function renderList() {
   if (caret) {
     const ta = el.boxlist.querySelector(`.card[data-id="${caret.id}"] textarea`);
     if (ta) {
-      ta.focus();
-      try { ta.setSelectionRange(caret.start, caret.end); } catch (_) { /* ignore */ }
+      // The focus listener selects the box it belongs to, which is right for a
+      // real click and wrong here: putting the caret back where it was must not
+      // move the selection. Without this flag, drawing a box while editing an
+      // earlier region handed the selection straight back to that region, and
+      // the next keystrokes went into its text instead of the new box's.
+      restoringCaret = true;
+      try {
+        ta.focus();
+        try { ta.setSelectionRange(caret.start, caret.end); } catch (_) { /* ignore */ }
+      } finally {
+        restoringCaret = false;
+      }
+      markSelection();
     }
   }
 }

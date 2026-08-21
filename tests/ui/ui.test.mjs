@@ -48,11 +48,21 @@ const doc = window.document;
 const OCR_TEXT = 'W5062 184 garbled';
 
 const HIDDEN_SPANS = [
-  { text: 'F1ow ra7e Z14.9 1/m1n', mode: 3, kind: 'invisible',
+  { text: 'F1ow ra7e Z14.9 1/m1n', mode: 3, kind: 'invisible', id: 11,
     rect: { x0: 0.12, y0: 0.25, x1: 0.60, y1: 0.28 } },
-  { text: '5amp1e 1D QF-348O-<', mode: 0, kind: 'behind image',
+  { text: '5amp1e 1D QF-348O-<', mode: 0, kind: 'behind image', id: 12,
     rect: { x0: 0.12, y0: 0.30, x1: 0.55, y1: 0.33 } },
 ];
+
+// Knobs the later regression tests turn: response delays make ordering
+// observable, and the document shape has to change to test paging.
+const stub = {
+  hiddenSpans: HIDDEN_SPANS,
+  hiddenDelay: 0,
+  ocrDelay: 0,
+  pages: [{ index: 0, width: 595, height: 842, rotation: 0, has_text: false }],
+  docId: 'a'.repeat(32),
+};
 
 window.fetch = async (url, opts = {}) => {
   calls.push({ url, method: opts.method, body: opts.body });
@@ -63,18 +73,20 @@ window.fetch = async (url, opts = {}) => {
     json: async () => obj,
   });
   if (url.startsWith('/api/hidden/')) {
-    return json({ spans: HIDDEN_SPANS, untraceable_chars: 0 });
+    if (stub.hiddenDelay) await new Promise((r) => setTimeout(r, stub.hiddenDelay));
+    return json({ spans: stub.hiddenSpans, untraceable_chars: 0 });
   }
   switch (url) {
     case '/api/health':
       return json({ ok: true, tesseract: { available: true, version: '5.4.0', langs: ['eng', 'spa'] } });
     case '/api/upload':
       return json({
-        doc_id: 'a'.repeat(32),
+        doc_id: stub.docId,
         filename: 'scan.pdf',
-        pages: [{ index: 0, width: 595, height: 842, rotation: 0, has_text: false }],
+        pages: stub.pages,
       });
     case '/api/ocr':
+      if (stub.ocrDelay) await new Promise((r) => setTimeout(r, stub.ocrDelay));
       return json({
         text: OCR_TEXT,
         existing_invisible_text: 'W5O62 l84 (wrong OCR layer)',
@@ -313,6 +325,169 @@ ok(delBox.text === '', 'and it carries no text to write');
 ok(delBox.replace === true, 'replacement is forced on for it');
 ok(delPayload.boxes.filter((b) => !b.delete_only).length === 1,
   'the other region is sent normally');
+
+/* ------------------------------------------------------------------------- *
+ * Regressions from the flicker / save-mismatch hunt.
+ * ------------------------------------------------------------------------- */
+
+const hiddenCalls = () => calls.filter((c) => c.url.startsWith('/api/hidden/')).length;
+const pageImg = () => doc.getElementById('pageimg');
+
+group('an in-flight OCR reply must not overwrite what was typed');
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+stub.ocrDelay = 60;
+window.addBox({ x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.2 });
+await tick(10);                       // card exists, OCR still running
+const busyTa = doc.querySelector('.card textarea');
+ok(!!busyTa && !busyTa.disabled, 'the field is usable while OCR runs');
+busyTa.focus();
+busyTa.value = 'TYPED WHILE BUSY';
+busyTa.dispatchEvent(new window.Event('input', { bubbles: true }));
+await tick(120);                      // the reply lands after the typing
+ok(doc.querySelector('.card textarea').value === 'TYPED WHILE BUSY',
+  `the typed text survives the OCR reply (got "${doc.querySelector('.card textarea').value}")`);
+stub.ocrDelay = 0;
+
+group('a fresh region still takes the OCR result');
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+window.addBox({ x0: 0.1, y0: 0.3, x1: 0.9, y1: 0.4 });
+await tick(40);
+ok(doc.querySelector('.card textarea').value === OCR_TEXT,
+  'an untouched region is still filled from OCR');
+
+group('drawing a box while editing another region moves the caret to the new box');
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+window.addBox({ x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.2 });
+await tick(40);
+const editFirst = doc.querySelector('.card textarea');
+editFirst.focus();
+editFirst.value = 'CORRECTED ONE';
+editFirst.dispatchEvent(new window.Event('input', { bubbles: true }));
+pointer('pointerdown', overlay, 100, 600);
+pointer('pointermove', overlay, 500, 700);
+pointer('pointerup', overlay, 500, 700);
+await tick(60);
+const cards2 = [...doc.querySelectorAll('.card')];
+ok(cards2.length === 2, `a second region was drawn (got ${cards2.length})`);
+const selected = doc.querySelector('.card.sel');
+ok(!!selected && selected !== cards2[0],
+  'the new region is the selected one, not the one being edited');
+ok(cards2[0].querySelector('textarea').value === 'CORRECTED ONE',
+  'the earlier correction is untouched');
+
+group('two hidden spans with the same text stay separate objects');
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+stub.hiddenSpans = [
+  { text: 'Total', mode: 3, kind: 'invisible', id: 21,
+    rect: { x0: 0.10, y0: 0.20, x1: 0.30, y1: 0.24 } },
+  { text: 'Total', mode: 3, kind: 'invisible', id: 22,
+    rect: { x0: 0.10, y0: 0.60, x1: 0.30, y1: 0.64 } },
+];
+// Re-upload so the hidden cache is dropped and the new spans are fetched.
+await window.loadPdf(new window.File([new Uint8Array([1])], 'dup.pdf', { type: 'application/pdf' }));
+await tick(40);
+ok(outlines().length === 2, `both same-text spans are outlined (got ${outlines().length})`);
+pointer('pointerdown', outlines()[0], 150, 220);
+pointer('pointerup', overlay, 150, 220);
+await tick(20);
+ok(doc.querySelectorAll('.card').length === 1, 'the first one is picked up');
+ok(doc.querySelectorAll('.hx.used').length === 1,
+  `only the clicked outline is marked used (got ${doc.querySelectorAll('.hx.used').length})`);
+pointer('pointerdown', outlines()[1], 150, 620);
+pointer('pointerup', overlay, 150, 620);
+await tick(20);
+ok(doc.querySelectorAll('.card').length === 2,
+  `the second occurrence is reachable too (got ${doc.querySelectorAll('.card').length} card(s))`);
+doc.getElementById('save').click();
+await tick(30);
+const dupPayload = JSON.parse(calls.filter((c) => c.url === '/api/save').pop().body);
+ok(dupPayload.boxes.length === 2, 'both are sent to the backend');
+ok(Math.abs((dupPayload.boxes[0]?.rect.y0 ?? -1) - 0.20) < 1e-9
+  && Math.abs((dupPayload.boxes[1]?.rect.y0 ?? -1) - 0.60) < 1e-9,
+  'each carries its own coordinates, so a correction lands on the right one');
+
+group('a cancelled drag cannot become a phantom region');
+while (doc.querySelector('.card-head .del')) doc.querySelector('.card-head .del').click();
+pointer('pointerdown', overlay, 100, 100);
+pointer('pointermove', overlay, 300, 300);
+overlay.dispatchEvent(new window.MouseEvent('pointercancel', { bubbles: true, button: 0, clientX: 300, clientY: 300 }));
+ok(doc.querySelectorAll('.ghost').length === 0, 'the ghost rectangle is cleaned up');
+pointer('pointerup', overlay, 700, 900);          // a later stray release
+await tick(30);
+ok(doc.querySelectorAll('.card').length === 0,
+  `no phantom region was created (got ${doc.querySelectorAll('.card').length})`);
+
+group('paging is quiet: no refetch, no rebuilt cards');
+stub.docId = 'b'.repeat(32);
+stub.pages = [0, 1, 2].map((i) => ({ index: i, width: 595, height: 842, rotation: 0, has_text: false }));
+stub.hiddenSpans = HIDDEN_SPANS;
+await window.loadPdf(new window.File([new Uint8Array([1])], 'multi.pdf', { type: 'application/pdf' }));
+await tick(40);
+ok(doc.getElementById('pagecount').textContent === '3', 'a 3-page document is loaded');
+
+window.addBox({ x0: 0.1, y0: 0.1, x1: 0.9, y1: 0.2 });
+await tick(40);
+const keptTa = doc.querySelector('.card textarea');
+keptTa.focus();
+keptTa.value = 'STILL HERE';
+keptTa.dispatchEvent(new window.Event('input', { bubbles: true }));
+keptTa.setSelectionRange(5, 5);
+
+const beforeHidden = hiddenCalls();
+const beforeSrc = pageImg().src;
+// Re-entering the page number you are already on. Going through the field
+// rather than `prev` matters: prev is disabled on page 1, so clicking it proves
+// nothing about the guard.
+doc.getElementById('pageno').value = '1';
+doc.getElementById('pageno').dispatchEvent(new window.Event('change', { bubbles: true }));
+await tick(30);
+ok(hiddenCalls() === beforeHidden, 'a no-op page change does not refetch hidden text');
+ok(pageImg().src === beforeSrc, 'and does not reload the page image');
+ok(doc.querySelector('.card textarea') === keptTa, 'the live textarea is not replaced');
+ok(doc.activeElement === keptTa && keptTa.selectionStart === 5, 'the caret is untouched');
+
+doc.getElementById('pageno').value = '99';    // out of range, clamps to page 3
+doc.getElementById('pageno').dispatchEvent(new window.Event('change', { bubbles: true }));
+await tick(40);
+ok(doc.getElementById('pageno').value === '3', 'an out-of-range page snaps back');
+
+group('a real page change keeps the cards but refreshes outlines');
+const cardsBefore = doc.querySelectorAll('.card').length;
+const hiddenBeforeReal = hiddenCalls();
+doc.getElementById('prev').click();           // page 3 -> page 2, a real move
+await tick(40);
+ok(hiddenCalls() === hiddenBeforeReal + 1, 'the new page fetches its hidden text');
+ok(doc.querySelectorAll('.card').length === cardsBefore,
+  'regions from other pages stay listed');
+ok(doc.querySelector('.card textarea') === keptTa,
+  'and their textareas are still the same live elements');
+
+group('revisiting a page is served from cache');
+const beforeRevisit = hiddenCalls();
+doc.getElementById('next').click();           // back to page 3, already seen
+await tick(40);
+doc.getElementById('prev').click();
+await tick(40);
+ok(hiddenCalls() === beforeRevisit, 'paging back and forth issues no new requests');
+
+group('a slow hidden-text reply for the previous document is discarded');
+stub.hiddenDelay = 80;
+stub.docId = 'c'.repeat(32);
+stub.hiddenSpans = [{ text: 'OLD DOC SPAN', mode: 3, kind: 'invisible', id: 31,
+  rect: { x0: 0.1, y0: 0.1, x1: 0.4, y1: 0.14 } }];
+const slow = window.loadPdf(new window.File([new Uint8Array([1])], 'slow.pdf', { type: 'application/pdf' }));
+await tick(10);
+stub.docId = 'd'.repeat(32);
+stub.hiddenSpans = [{ text: 'NEW DOC SPAN', mode: 3, kind: 'invisible', id: 41,
+  rect: { x0: 0.5, y0: 0.5, x1: 0.8, y1: 0.54 } }];
+stub.hiddenDelay = 0;
+await window.loadPdf(new window.File([new Uint8Array([1])], 'new.pdf', { type: 'application/pdf' }));
+await slow;
+await tick(150);                              // the stale reply arrives late
+const titles = outlines().map((o) => o.title).join(' | ');
+ok(!/OLD DOC SPAN/.test(titles),
+  'the previous document\'s spans never appear over the new one');
+ok(/NEW DOC SPAN/.test(titles), 'the current document\'s spans are shown');
 
 console.log(failures === 0
   ? '\nOK - all frontend checks passed'
