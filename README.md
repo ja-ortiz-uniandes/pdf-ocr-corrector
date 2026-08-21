@@ -312,7 +312,7 @@ hidden OCR layer removes it without changing a pixel, a partly covered hidden li
 goes whole while a barely clipped one is left alone (both sides of the 20%
 threshold), mode 3 / zero-opacity / white-fill / clip-only layers are all handled,
 **visible text survives even a whole-page selection**, hidden lines overlapping
-visible ink are protected, the appearance guard restores a page when deletion would
+visible ink are protected, the appearance guard refuses a deletion that would
 have changed the render, boxes on `/Rotate 90/180/270` pages land where you drew
 them (checked against rendered pixels, not against another PyMuPDF call), accents
 survive and unsupported characters are reported, and the API rejects bad input. The
@@ -347,7 +347,7 @@ guess.
 | Text embedded but selection sits too high or low | Redraw the box to hug the text block more tightly; the layer is fitted to the box, not to the ink. |
 | Old wrong text still there after saving | The region's **Delete the old OCR text here** box was unticked, or your box overlapped less than ~20% of the hidden line. Redraw it larger, and see *"If deleting the old text seems to do nothing"* above. |
 | Banner mentions protected lines | Those hidden lines overlap visible ink, so removing them would have erased visible words. Nothing to fix — the visible text is authoritative there. |
-| Banner says the deletion "would have changed how the page looks" | The appearance guard rejected it and restored the page. Usually means the text you boxed is actually drawn on the page, so it should not be deleted anyway. |
+| Banner says the deletion "would have changed how the page looks" | The appearance guard tried the deletion on a copy first, saw the page change, and left the page alone. Usually means the text you boxed is actually drawn on the page, so it should not be deleted anyway. |
 | Browser did not open | Open the URL printed in the console manually. Set `PDFOCR_NO_BROWSER=1` to disable auto-open. |
 | Want a different port | `PDFOCR_PORT=9000` before launching. |
 

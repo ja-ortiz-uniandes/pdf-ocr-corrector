@@ -71,11 +71,21 @@ everything looks fine at `/Rotate 0`, which most PDFs use.
 
 | space | reported by | used by |
 | --- | --- | --- |
-| **view** (rotated) | `page.rect`, `get_pixmap()` — what the browser renders and the user draws on | `get_pixmap(clip=...)`, i.e. the OCR crop |
-| **unrotated** (rotation-independent) | never changes when `/Rotate` does | `insert_text()`, `get_text()`, `search_for()`, `get_texttrace()`, redaction annotations |
+| **view** (rotated) | `page.rect`, `get_pixmap()` — what the browser renders and the user draws on | `get_pixmap(clip=...)` — the OCR crop *and* every burial probe; layout of the inserted text |
+| **unrotated** (rotation-independent) | never changes when `/Rotate` does | `get_text()`, `search_for()`, `get_texttrace()`, redaction annotations, and `insert_text()`'s anchor point |
 
 `_rect_from_norm()` produces a **view** rect; `_text_rect()` converts it to unrotated space via
-`page.derotation_matrix`. Every text operation must go through `_text_rect()`; the OCR crop must not.
+`page.derotation_matrix`. Lookups and deletion go through `_text_rect()`; anything handed to
+`get_pixmap(clip=...)` must not, and a rect that came from `get_texttrace()` has to be multiplied by
+`page.rotation_matrix` on its way there (`_burial_confirmed`).
+
+**Insertion straddles both spaces.** `_insert_invisible_text()` takes the **view** rect, because line
+height and font size have to be fitted to the box the user actually drew: on a rotated page the box's
+width and height swap in unrotated space, so fitting there turned a wide one-line box into a tall narrow
+one and produced a 1.4 pt sliver at fontsize 1. Only the per-line anchor is mapped with
+`derotation_matrix`, and `rotate=page.rotation` is passed so glyph advance follows the text on screen.
+`TestRotatedInsertionGeometry` pins the shape (width, orientation, fitted size) rather than mere
+containment, which a degenerate sliver satisfies.
 
 Beware of writing circular rotation tests: comparing `insert_text()` output against `search_for()` proves
 nothing, because both live in unrotated space, so a wrong view→unrotated mapping stays invisible and the
@@ -131,13 +141,23 @@ are passed around as a set of `seqno` values (`buried`) that `_region_text`, `_v
 
 `_clearable_rects()` then plans the deletion:
 
-- **No visible glyph intersects the selection** (the normal scan case): the selection rect itself is
-  cleared, which is also the only way to reach clip-only mode-7 text.
+- **No visible glyph intersects the selection** (the normal scan case): the selection rect is cleared as
+  a set of horizontal **bands** (`_blanket_bands()`), which is also the only way to reach clip-only
+  mode-7 text.
 - Any hidden span whose bbox overlaps the selection by at least `COVERAGE_TO_DELETE` (20%) is cleared
   **whole**, including the part outside the selection. Selections never align with the OCR layer's own
-  boxes, so per-glyph deletion left fragments; this is the behaviour users expect. Below the threshold the
-  span is untouched, which keeps a barely clipped neighbouring line safe.
-- A hidden span overlapping visible ink is skipped and counted as `lines_protected`.
+  boxes, so per-glyph deletion left fragments; this is the behaviour users expect.
+- Below the threshold the span is spared, and **its row is carved out of the blanket rect too**. This is
+  the whole reason bands exist: `apply_redactions()` drops every glyph its rectangles touch, so a single
+  blanket rect covering the selection deleted barely clipped neighbours no matter what the threshold
+  said. A 10% clipped line was destroyed exactly like a 30% one, invisibly, since mode-3 glyphs leave the
+  render identical and the guard therefore sees nothing wrong. Redaction is also boundary-inclusive and
+  matches the glyph's **em box**, not the tight bbox `get_texttrace()` reports, so each spared row is
+  padded by `max(2pt, 25% of its height)` — measured: a 12 pt line needs ~2 pt of clearance, a 48 pt line
+  ~12 pt.
+- A hidden span overlapping visible ink is skipped, its row carved out as well, and its `seqno` returned.
+  `_clearable_rects()` returns a **set of seqnos**, not a count, so several boxes on one page that all
+  clip the same spared line report it once (`lines_protected`) instead of once per box.
 
 `_clear_invisible_text()` redacts with `add_redact_annot(rect, fill=False)` +
 `apply_redactions(images=KEEP_IMAGES, graphics=KEEP_GRAPHICS, text=DROP_TEXT)`. **`fill=False` is
@@ -146,13 +166,26 @@ essential** — the default `fill=(1, 1, 1)` paints a white rectangle over the s
 Boxes are grouped by page, and a page's redactions are applied **before** any text is inserted; reversing
 that order makes `apply_redactions()` strip the text just written.
 
-**The appearance guard makes the invariant enforced rather than intended.** Each touched page is rendered
-at `VERIFY_DPI` before and after clearing; if the bytes differ, something visible was removed, so
-`_restore_page()` reinstates the page from a pristine second handle on the original file and
-`pages_appearance_guarded` is reported. The correction is still inserted. This covers any future
+**The appearance guard makes the invariant enforced rather than intended.** `_clear_is_invisible()` runs
+the planned clearing on a **throwaway copy** of the original file and compares `VERIFY_DPI` renders; only
+if they match byte for byte is the deletion applied to the live document. Otherwise nothing is deleted,
+`pages_appearance_guarded` is reported, and the correction is still inserted. This covers any future
 classification gap in `_is_hidden()` — a misclassified layer fails closed instead of destroying content.
 `test_appearance_guard_refuses_a_damaging_deletion` monkey-patches `_visible_boxes` to empty to force that
 path.
+
+**Verify-then-apply rather than apply-then-undo, deliberately.** An earlier version cleared the live page
+and put it back afterwards with `delete_page()` + `insert_pdf()`. That produces a *new* page object, which
+silently breaks everything referring to the old one: outline destinations resolved to `-1`, form fields
+were renamed (`fld1` → `fld1 [33]`), both surviving `save(garbage=3)`, and the caller's own `page` handle
+went stale mid-loop. Restoring only the content stream does not work either, because `apply_redactions()`
+rewrites the page's **resources** as well, so the old stream ends up referring to XObjects that no longer
+exist (`cannot find XObject resource 'fzImg0'`). `TestAppearanceGuardKeepsPageIdentity` asserts the TOC,
+the widget names and the rendered pixels all survive a guarded save.
+
+`chars_removed` is measured with `_chars_in_rects()` over the rects actually handed to
+`apply_redactions()`, before and after. Counting `get_text(clip=selection)` instead under-reported a
+horizontally clipped span (12 of 28 characters) and double-counted two overlapping boxes.
 
 `check_pdf_text.py --modes` prints each span's render mode and hidden/visible verdict using the app's own
 `_is_hidden()`, and flags the character-count gap that indicates clip-only text. It is the first thing to
@@ -162,6 +195,19 @@ run when deletion appears to do nothing on a real file.
 `get_text(clip=...)`. `/api/ocr` surfaces both so the UI can say "this hidden text will go" and "this
 visible text is kept" independently.
 
+**What `/api/ocr` promises must be what `/api/save` does.** `_region_text()` qualifies a span on a bare
+`intersects()`, while the save applies `COVERAGE_TO_DELETE` and skips anything overlapping ink, so the UI
+used to offer (pre-checked) deletions that then silently did not happen — `chars_removed: 0` with a banner
+that still said "Saved". `/api/ocr` therefore runs the *same* `_clearable_rects()` plan and reports
+`existing_invisible_text` as only what `_hidden_text_in()` finds inside those rects, with the remainder in
+`existing_invisible_kept` so the card can say that text is being left alone.
+
+Burial verdicts are memoised in `_BURIED_CACHE` keyed by `(doc_id, page)` and shared by `/api/hidden`,
+`/api/ocr` and `/api/save` via `_confirm_buried_cached()`. `original.pdf` never changes once uploaded, so
+the verdict is good for the document's life. Uncached, `/api/hidden` re-ran up to `MAX_BURIAL_PROBES`
+render probes on every visit — 1.5-2.2 s per call on a 3.4 MB scan — which is most of what made paging
+feel like the page was flickering.
+
 ### Hidden-text outlines (`GET /api/hidden/<doc_id>/<page>`)
 
 The OCR layer is invisible, so the UI outlines it and lets the user click an object instead of guessing
@@ -169,8 +215,14 @@ where it sits. The endpoint returns each hidden span's text plus its rect **norm
 `(bbox * page.rotation_matrix)` then divided by `page.rect` — which is the inverse of `_text_rect()` and is
 what makes a click map straight back to a selection on rotated pages.
 
+Each span also carries an `id` (its `seqno`), and the frontend's `spanKey()` keys regions off that.
+Matching on the span's **text** instead collapsed two spans holding the same string onto one: on a page
+with two hidden `Total`s, both outlines greyed out after the first click, the second was unreachable
+(`select()` early-returns), it survived the save, and a correction typed for it was written at the *first*
+one's coordinates. `spanKey()` falls back to text plus position when a span has no `seqno`.
+
 Clicking an outline creates a region prefilled with that text, `replace` forced on, and **no OCR call** —
-correcting a misread word should not risk a fresh misread. `sourceText` links the region to the span so
+correcting a misread word should not risk a fresh misread. `sourceKey` links the region to the span so
 re-clicking selects instead of duplicating, and claimed outlines render `.used`.
 
 It deliberately does **not** focus the text field, which keeps `Delete` available as a global shortcut:
@@ -202,7 +254,8 @@ would silently delete the existing layer. Reported separately as `boxes_deleted_
   typographic quotes/dashes and replaces anything unencodable with `?`, returning the dropped characters
   so the UI can report them. Supporting CJK/Cyrillic/Greek would mean embedding a TTF.
 - `_insert_invisible_text()` writes **one PDF text line per input line**, each sized to fit both its share
-  of the box height and the box width. Text is fitted to the *box*, not to the ink.
+  of the box height and the box width, measured in **view** space (see the coordinate contract above).
+  Text is fitted to the *box*, not to the ink.
 - The source document is opened and saved to a new path under `work/<doc_id>/output/`; the original bytes
   are never rewritten. A test hashes the stored original to prove it.
 
@@ -221,6 +274,17 @@ local file. `/api/page/*` is exempt: renders are large and immutable per (page, 
 own header. The frontend also guards `el.showhidden` for null, so a stale `index.html` degrades to "no
 outlines" instead of throwing and taking the whole script down.
 
+`no-store` is why the expensive work behind `/api/*` is cached in process instead (`_BURIED_CACHE`) and
+per page in the frontend (`state.hiddenCache`).
+
+### Error bodies
+
+An `HTTPException` handler renders every `abort()` as `{"error", "description"}` JSON. The frontend's
+`api()` only parses a body whose content type is JSON and then reads `description`, so with Werkzeug's
+default HTML pages the user saw bare status lines — a password-protected upload reported "BAD REQUEST" —
+while the two hand-written `jsonify` error paths (Tesseract missing, OCR failed) read properly. Keep new
+error paths on `abort()`; they are covered automatically.
+
 ### Frontend
 
 Classic script, no modules, no build step, no external requests (a strict local-only tool must not pull
@@ -234,6 +298,28 @@ caused one bug:
   clicked, silently discarding every keystroke.
 - Rebuilds that *are* necessary (add/remove/OCR-complete) save and restore the focused region plus caret
   offset, so an OCR response arriving for one region cannot yank the caret out of another.
+- **The caret restore must not move the selection.** `ta.focus()` fires the textarea's focus listener,
+  which selects that card — correct for a click, wrong for a restore. `restoringCaret` gates it. Without
+  the gate, drawing a box while editing an earlier region handed the selection straight back to that
+  region, and because the overlay's `pointerdown` calls `preventDefault()` (so the old field keeps focus)
+  `runOcr`'s `typingElsewhere` check then refused to focus the new box: the next keystrokes appended to
+  the *previous* region's corrected text. It also swallowed the documented outline + `Delete` loop.
+- **`showPage()` early-returns for the page already shown**, and does *not* call `renderList()` at all,
+  since no card depends on the current page. The clamp turns Left on page 1, and any out-of-range page
+  number, into "the page you are on", which used to re-fetch the render, drop every outline, and rebuild
+  the whole sidebar.
+- **Hidden outlines are cached per page** (`state.hiddenCache`) and the loader no longer blanks them
+  before awaiting, so only the first visit to a page can blink. They cannot simply be left up while
+  loading, because they are positioned in the current page's coordinates.
+- `loadHidden()`'s staleness guard checks **document and page**. A new upload resets to page 0, so the
+  page alone let a reply about the previous document through, and clicking one of its outlines wrote the
+  old file's text at the old file's coordinates into the new file.
+- **OCR replies never overwrite an edited box.** The field stays editable while `b.busy`, so typing can
+  beat the reply; `b.edited` guards the assignment and the raw result is kept in `b.ocrText` for **Re-OCR**.
+- **A gesture must be torn down on `pointercancel` / `lostpointercapture`** (`endDrag()`), not only on
+  `pointerup`. A stale non-null `drag` turned the next plain click into the end of the abandoned drag and
+  created a phantom region that ran OCR and was written on save. `.overlay` also sets `touch-action: none`
+  so a touch drag cannot become a scroll mid-gesture.
 
 `tests/ui/ui.test.mjs` drives the real `static/app.js` in jsdom against a stubbed backend and guards
 exactly these behaviours. It loads the script via an injected inline `<script>` with
@@ -324,15 +410,36 @@ it can be restored on a new device. Adding a second device's key: generate a key
 (`git-age keys generate`), then from a device that already has access run `git-age add-recipient <new
 public key>`, which appends it to `.agerecipients`, re-encrypts every tracked file, and commits.
 
-Per-machine setup, all four steps, none of them derivable from the repo: install `git-age`
+`merge=age` is served by `tools/git-age-merge.sh`, registered **per clone** (the script ships with the
+repo, so the path is repo-relative):
+
+```bash
+git config merge.age.driver 'bash tools/git-age-merge.sh %O %A %B %L %P'
+```
+
+It decrypts the three sides, runs `git merge-file` on the plaintext, and re-encrypts the result, so
+conflicts arrive as ordinary markers in readable text. Without it git has no driver for that attribute and
+silently falls back to its normal merge, which compares two *ciphertexts*: `-text` makes it a binary
+conflict, and resolving that by taking one side drops everything the other machine wrote. The driver
+refuses to write anything that is not age-encrypted into `%A`, since `%A` is a blob, not a working-tree
+file, and plaintext there would be committed unencrypted.
+
+It also strips CR before merging. `-text` is needed so git does not mangle the ciphertext, but it *also*
+opts the file out of the repo's `eol=lf` rule, so a Windows editor can commit CRLF verbatim; merging that
+against an LF side makes every line differ and produces a whole-file conflict that looks exactly like a
+broken driver. (Found the hard way while testing this: a Python `write_text()` on Windows did it.)
+
+Per-machine setup, all five steps, none of them derivable from the repo: install `git-age`
 (`winget install prskr.git-age` on Windows, which appends its own package directory to the user PATH, so
 existing shells need a restart before `git-age` resolves); run `git-age install` to register the filters
-globally; restore the private key from Bitwarden to `%LOCALAPPDATA%\git-age\keys.txt`; and run
-`git config --global diff.age.textconv cat` so `git diff` shows plaintext instead of ciphertext noise.
-Check with `git config --global --get-regexp '(filter|diff|merge)\.age'`, which must list
-`filter.age.clean`, `filter.age.smudge`, `filter.age.required` and `diff.age.textconv`.
+globally; restore the private key from Bitwarden to `%LOCALAPPDATA%\git-age\keys.txt`; run
+`git config --global diff.age.textconv cat` so `git diff` shows plaintext instead of ciphertext noise; and
+register the merge driver in each clone (the `git config merge.age.driver ...` line above). Check with
+`git config --global --get-regexp '(filter|diff)\.age'`, which must list `filter.age.clean`,
+`filter.age.smudge`, `filter.age.required` and `diff.age.textconv`, plus `git config --get merge.age.driver`
+inside the clone.
 
-Until all four are done the failure looks like two different things: with no filter registered a checkout
+Until those are done the failure looks like two different things: with no filter registered a checkout
 leaves *ciphertext* in the working tree (git treats an undefined filter as pass-through, silently), while
 with the filter registered but no key present every `git status`, `git add` or checkout touching
 `TODO.md` dies with `no identities specified`, since `filter.age.required` is true. The second failure
