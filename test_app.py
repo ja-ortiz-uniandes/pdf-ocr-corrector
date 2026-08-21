@@ -1188,5 +1188,411 @@ class TestOcr(Base):
             "/api/ocr", json={"doc_id": doc_id, "page": 42, "rect": self.BLOCK}).status_code, 404)
 
 
+def _png_bytes(w: int, h: int, colour: tuple[int, int, int] = (170, 170, 170)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), colour).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _norm(page: fitz.Page, view: fitz.Rect) -> dict:
+    """A view-space rect as the normalised 0..1 shape the browser posts."""
+    pr = page.rect
+    return {
+        "x0": (view.x0 - pr.x0) / pr.width, "y0": (view.y0 - pr.y0) / pr.height,
+        "x1": (view.x1 - pr.x0) / pr.width, "y1": (view.y1 - pr.y0) / pr.height,
+    }
+
+
+class TestRotatedInsertionGeometry(Base):
+    """
+    The layer is laid out in *view* space, so a wide box stays wide at every
+    /Rotate value.
+
+    `test_rotated_pages_land_on_what_the_user_boxed` only asserts containment in
+    the block rect, which a degenerate sliver satisfies. These check the shape:
+    laying out in unrotated space turned a 483 x 175 pt box on a /Rotate 90 page
+    into a 1.4 pt wide vertical line at fontsize 1.
+    """
+
+    PROBE = "ROTATION PROBE"
+
+    def test_layer_fills_the_drawn_box_at_every_rotation(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                src = fitz.open(SAMPLE)
+                src[2].set_rotation(rotation)
+                data = src.tobytes()
+                norm = block_view_norm(src[2])
+                src.close()
+
+                doc_id = self.upload(data, f"geom{rotation}.pdf")
+                out = self.save(doc_id, [{
+                    "page": 2, "rect": norm, "replace": False, "text": self.PROBE,
+                }])
+                doc = fitz.open(out["output_path"])
+                try:
+                    page = doc[2]
+                    hits = page.search_for(self.PROBE)
+                    self.assertEqual(len(hits), 1, "probe text not found")
+                    # Back into the space the user drew in.
+                    view_hit = (hits[0] * page.rotation_matrix).normalize()
+                    drawn = (fitz.Rect(BLOCK_UNROTATED)
+                             * page.rotation_matrix).normalize()
+
+                    self.assertGreater(
+                        view_hit.width, drawn.width * 0.5,
+                        f"text should span the box the user drew, got "
+                        f"{view_hit.width:.1f} pt of {drawn.width:.1f} pt")
+                    self.assertGreater(
+                        view_hit.width, view_hit.height,
+                        "a horizontal box must produce a horizontal line")
+                    self.assertLessEqual(
+                        view_hit.height, drawn.height + 2,
+                        "the line must stay inside the box vertically")
+                    self.assertAlmostEqual(view_hit.x0, drawn.x0, delta=6)
+                finally:
+                    doc.close()
+
+    def test_font_size_is_not_collapsed_by_rotation(self):
+        sizes = {}
+        for rotation in (0, 90, 180, 270):
+            src = fitz.open(SAMPLE)
+            src[2].set_rotation(rotation)
+            data = src.tobytes()
+            norm = block_view_norm(src[2])
+            src.close()
+
+            doc_id = self.upload(data, f"size{rotation}.pdf")
+            out = self.save(doc_id, [{
+                "page": 2, "rect": norm, "replace": False, "text": self.PROBE,
+            }])
+            doc = fitz.open(out["output_path"])
+            try:
+                span = next(s for s in doc[2].get_texttrace()
+                            if self.PROBE in "".join(chr(c[0]) for c in s["chars"]))
+                sizes[rotation] = round(span["size"], 1)
+            finally:
+                doc.close()
+
+        self.assertGreater(min(sizes.values()), 10,
+                           f"font collapsed on some rotation: {sizes}")
+        # 90/270 legitimately differ from 0/180: rotating the page makes the same
+        # block appear narrow and tall on screen, and the layer is fitted to the
+        # box the user drew there. What must not happen is a collapse to ~1pt,
+        # which is what laying out in unrotated space produced.
+        self.assertEqual(sizes[0], sizes[180], f"same shape on screen: {sizes}")
+        self.assertEqual(sizes[90], sizes[270], f"same shape on screen: {sizes}")
+        # And the size must actually follow the on-screen box: at 90/270 the same
+        # block is narrow, so the fitted size has to come down. Equal sizes at
+        # every rotation is the signature of fitting to the unrotated rect, which
+        # is what put the layer sideways.
+        self.assertLess(sizes[90], sizes[0],
+                        f"size must follow the box as drawn on screen: {sizes}")
+
+
+class TestBurialProbeOnRotatedPages(Base):
+    """
+    `get_pixmap(clip=)` reads view space while span bboxes are unrotated, so the
+    burial probe has to convert. Without that, a /Rotate 180 page renders blank
+    on both sides of the experiment, every visible span looks buried, the
+    blanket rect takes the visible text with it, and the appearance guard then
+    throws away every deletion on the page.
+    """
+
+    HIDDEN = "GARBLED 0CR LAYER"
+    CAPTION = "CAPTION OVER IMAGE"
+
+    def _build(self, rotation: int) -> bytes:
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_image(fitz.Rect(0, 0, 300, 200), stream=_png_bytes(300, 200))
+        page.insert_text(fitz.Point(20, 60), self.HIDDEN, fontname="helv",
+                         fontsize=12, render_mode=3)
+        page.insert_text(fitz.Point(20, 150), self.CAPTION, fontname="helv",
+                         fontsize=12)
+        page.set_rotation(rotation)
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    def test_hidden_layer_is_cleared_at_every_rotation(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                data = self._build(rotation)
+                probe = fitz.open("pdf", data)
+                # The band the hidden line occupies, in view space.
+                view = (fitz.Rect(15, 45, 250, 65)
+                        * probe[0].rotation_matrix).normalize()
+                norm = _norm(probe[0], view)
+                probe.close()
+
+                doc_id = self.upload(data, f"burial{rotation}.pdf")
+                out = self.save(doc_id, [{
+                    "page": 0, "rect": norm, "delete_only": True, "text": "",
+                }])
+                self.assertEqual(out["pages_appearance_guarded"], 0,
+                                 "nothing visible was at risk, so no guard")
+                self.assertGreater(out["chars_removed"], 0)
+
+                doc = fitz.open(out["output_path"])
+                try:
+                    words = doc[0].get_text("text")
+                    self.assertNotIn(self.HIDDEN, words,
+                                     "the hidden layer should be gone")
+                    self.assertIn(self.CAPTION, words,
+                                  "the visible caption must survive")
+                finally:
+                    doc.close()
+
+    def test_visible_text_over_an_image_is_never_called_buried(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                data = self._build(rotation)
+                # _confirm_buried reads the file from disk for its probe, so the
+                # document has to exist as an upload.
+                doc_id = self.upload(data, f"nb{rotation}.pdf")
+                src = A._original_pdf(doc_id)
+                doc = fitz.open(src)
+                try:
+                    buried = A._confirm_buried(doc[0], src, 0)
+                    texts = " ".join(
+                        "".join(chr(c[0]) for c in s["chars"])
+                        for s in doc[0].get_texttrace()
+                        if s.get("seqno") in buried
+                    )
+                    self.assertNotIn(self.CAPTION, texts,
+                                     "visible caption misclassified as buried")
+                finally:
+                    doc.close()
+
+
+class TestBlanketRectSparesNeighbours(Base):
+    """
+    A hidden line below `COVERAGE_TO_DELETE` must survive, and that means keeping
+    it out of the blanket selection rect as well: `apply_redactions()` drops
+    every glyph its rectangles touch, so a blanket rect covering the whole
+    selection deleted barely clipped neighbours regardless of the threshold.
+    """
+
+    TARGET = "TARGET LINE TO REPLACE"
+    NEIGHBOUR = "NEIGHBOUR LINE KEEP ME"
+
+    def _build(self) -> bytes:
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text(fitz.Point(40, 100), self.TARGET, fontname="helv",
+                         fontsize=12, render_mode=3)
+        page.insert_text(fitz.Point(40, 130), self.NEIGHBOUR, fontname="helv",
+                         fontsize=12, render_mode=3)
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    def test_barely_clipped_neighbour_survives_a_save(self):
+        data = self._build()
+        doc = fitz.open("pdf", data)
+        neighbour = next(fitz.Rect(s["bbox"]) for s in doc[0].get_texttrace()
+                         if self.NEIGHBOUR in "".join(chr(c[0]) for c in s["chars"]))
+        # Cover the target fully, then reach ~10% into the neighbour's height.
+        cut = neighbour.y0 + neighbour.height * 0.1
+        norm = _norm(doc[0], fitz.Rect(30, 85, 380, cut))
+        coverage = ((fitz.Rect(30, 85, 380, cut) & neighbour).get_area()
+                    / neighbour.get_area())
+        doc.close()
+        self.assertLess(coverage, A.COVERAGE_TO_DELETE,
+                        "the neighbour must be below the delete threshold")
+
+        doc_id = self.upload(data, "spare.pdf")
+        out = self.save(doc_id, [{
+            "page": 0, "rect": norm, "replace": True, "text": "CORRECTED LINE",
+        }])
+        doc = fitz.open(out["output_path"])
+        try:
+            words = doc[0].get_text("text")
+            self.assertNotIn(self.TARGET, words, "the selected line should go")
+            self.assertIn(self.NEIGHBOUR, words,
+                          "a 10% clipped line must survive: the blanket rect "
+                          "has to carve its row out")
+            self.assertIn("CORRECTED LINE", words)
+        finally:
+            doc.close()
+
+    def test_clip_only_reach_is_kept_outside_the_spared_row(self):
+        """The blanket rect still exists, just banded, so mode-7 text is reachable."""
+        data = self._build()
+        doc = fitz.open("pdf", data)
+        try:
+            page = doc[0]
+            neighbour = next(fitz.Rect(s["bbox"]) for s in page.get_texttrace()
+                             if self.NEIGHBOUR in "".join(chr(c[0]) for c in s["chars"]))
+            sel = fitz.Rect(30, 85, 380, neighbour.y0 + neighbour.height * 0.1)
+            rects, protected = A._clearable_rects(page, sel, A._visible_boxes(page))
+            self.assertFalse(protected)
+            bands = [r for r in rects if abs(r.x0 - sel.x0) < 0.01]
+            self.assertTrue(bands, "a blanket band must remain")
+            for band in bands:
+                self.assertFalse(band.intersects(neighbour),
+                                 "no band may touch the spared line")
+        finally:
+            doc.close()
+
+
+class TestAppearanceGuardKeepsPageIdentity(Base):
+    """
+    The guard used to replace the page (delete_page + insert_pdf), which made a
+    new page object: outline destinations resolved to -1, form fields were
+    renamed, and the caller's own page handle went stale. It now verifies on a
+    copy and simply never applies a damaging deletion.
+    """
+
+    def _build(self) -> bytes:
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text(fitz.Point(30, 100), "VISIBLE HEADING", fontname="helv",
+                         fontsize=14)
+        widget = fitz.Widget()
+        widget.field_name = "fld1"
+        widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        widget.rect = fitz.Rect(30, 150, 200, 170)
+        widget.field_value = "keep me"
+        page.add_widget(widget)
+        doc.set_toc([[1, "Chapter One", 1]])
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    def test_guarded_page_keeps_toc_widgets_and_pixels(self):
+        data = self._build()
+        doc_id = self.upload(data, "identity.pdf")
+
+        # Force the damaging path: with no visible boxes known, the blanket rect
+        # covers the heading.
+        real = A._visible_boxes
+        A._visible_boxes = lambda page, buried=frozenset(): []
+        try:
+            out = self.save(doc_id, [{
+                "page": 0, "rect": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0},
+                "replace": True, "text": "CORRECTION",
+            }])
+        finally:
+            A._visible_boxes = real
+
+        self.assertEqual(out["pages_appearance_guarded"], 1, "guard must fire")
+
+        before = fitz.open("pdf", data)
+        after = fitz.open(out["output_path"])
+        try:
+            self.assertEqual(
+                before[0].get_pixmap(dpi=A.VERIFY_DPI).tobytes("png"),
+                after[0].get_pixmap(dpi=A.VERIFY_DPI).tobytes("png"),
+                "a guarded page must render identically")
+            self.assertEqual([e[:3] for e in before.get_toc()],
+                             [e[:3] for e in after.get_toc()],
+                             "outline destinations must survive the guard")
+            self.assertEqual([w.field_name for w in before[0].widgets()],
+                             [w.field_name for w in after[0].widgets()],
+                             "form field names must survive the guard")
+            self.assertIn("VISIBLE HEADING", after[0].get_text("text"))
+            self.assertIn("CORRECTION", after[0].get_text("text"),
+                          "the correction is still written")
+        finally:
+            before.close()
+            after.close()
+
+
+class TestReportedCounts(Base):
+    """`chars_removed` and `lines_protected` describe what actually happened."""
+
+    def test_protected_lines_are_counted_once_per_span(self):
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.insert_text(fitz.Point(40, 100), "VISIBLE INK HERE", fontname="helv",
+                         fontsize=12)
+        page.insert_text(fitz.Point(40, 100), "HIDDEN OVER INK", fontname="helv",
+                         fontsize=12, render_mode=3)
+        data = doc.tobytes()
+        norm = _norm(page, fitz.Rect(30, 85, 380, 105))
+        doc.close()
+
+        doc_id = self.upload(data, "protected.pdf")
+        box = {"page": 0, "rect": norm, "replace": True, "text": "X"}
+        one = self.save(doc_id, [dict(box)])
+        three = self.save(doc_id, [dict(box), dict(box), dict(box)])
+        self.assertEqual(one["lines_protected"], three["lines_protected"],
+                         "the same spared line must not be counted once per box")
+
+    def test_chars_removed_counts_the_whole_span_that_was_cleared(self):
+        text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.insert_text(fitz.Point(40, 100), text, fontname="helv", fontsize=12,
+                         render_mode=3)
+        span = next(fitz.Rect(s["bbox"]) for s in page.get_texttrace())
+        data = doc.tobytes()
+        # Clip horizontally: the selection covers only the left third, but the
+        # span is cleared whole, so the count must be the whole span.
+        norm = _norm(page, fitz.Rect(span.x0 - 2, span.y0 - 2,
+                                     span.x0 + span.width / 3, span.y1 + 2))
+        doc.close()
+
+        doc_id = self.upload(data, "counted.pdf")
+        out = self.save(doc_id, [{
+            "page": 0, "rect": norm, "delete_only": True, "text": "",
+        }])
+        self.assertEqual(out["chars_removed"], len(text),
+                         "a whole-span deletion must be counted whole")
+        doc = fitz.open(out["output_path"])
+        try:
+            self.assertNotIn(text, doc[0].get_text("text"))
+        finally:
+            doc.close()
+
+
+class TestClearablePromiseMatchesSave(Base):
+    """
+    What `/api/ocr` says it will delete has to be what `/api/save` deletes.
+    `_region_text` qualifies a span on a bare intersection, which promised
+    deletions the coverage threshold then declined.
+    """
+
+    def test_sub_threshold_text_is_not_reported_as_clearable(self):
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text(fitz.Point(40, 130), "BARELY TOUCHED LINE",
+                         fontname="helv", fontsize=12, render_mode=3)
+        span = next(fitz.Rect(s["bbox"]) for s in page.get_texttrace())
+        sel = fitz.Rect(30, 90, 380, span.y0 + span.height * 0.1)
+
+        _, invisible = A._region_text(page, sel)
+        self.assertIn("BARELY", invisible,
+                      "the span does intersect, hence the old promise")
+
+        rects, _ = A._clearable_rects(page, sel, A._visible_boxes(page))
+        self.assertNotIn("BARELY", A._hidden_text_in(page, rects),
+                         "but nothing of it would actually be deleted")
+        doc.close()
+
+
+class TestErrorsAreJson(Base):
+    def test_abort_bodies_are_json_with_a_description(self):
+        res = self.client.post(
+            "/api/upload",
+            data={"pdf": (io.BytesIO(b"not a pdf"), "x.pdf")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.headers["Content-Type"].split(";")[0],
+                         "application/json")
+        body = res.get_json()
+        self.assertTrue(body.get("description"),
+                        "the frontend reads `description` for its banner")
+
+    def test_not_found_is_json_too(self):
+        res = self.client.get("/api/page/" + "a" * 32 + "/0.png")
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.headers["Content-Type"].split(";")[0],
+                         "application/json")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -26,6 +26,7 @@ import fitz  # PyMuPDF
 import pytesseract
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from PIL import Image, ImageFilter, ImageOps
+from werkzeug.exceptions import HTTPException
 
 # Frozen (PyInstaller) builds split two directories that are identical when run from
 # source: BASE_DIR is where the executable lives, used for anything that must persist
@@ -336,9 +337,15 @@ def _burial_confirmed(source: Path, page_no: int, rects: list[fitz.Rect]) -> boo
         page = probe[page_no]
         zoom = VERIFY_DPI / 72.0
         matrix = fitz.Matrix(zoom, zoom)
-        before = page.get_pixmap(matrix=matrix, clip=clip).tobytes("png")
+        # `rects` are span bboxes, i.e. unrotated, but get_pixmap(clip=) reads
+        # view space. On a rotated page an unrotated clip points at the wrong
+        # area, the probe renders blank on both sides, and every span looks
+        # "buried" - which then makes the appearance guard throw the whole
+        # page's deletions away.
+        view_clip = (clip * page.rotation_matrix).normalize()
+        before = page.get_pixmap(matrix=matrix, clip=view_clip).tobytes("png")
         _clear_invisible_text(page, rects)
-        return page.get_pixmap(matrix=matrix, clip=clip).tobytes("png") == before
+        return page.get_pixmap(matrix=matrix, clip=view_clip).tobytes("png") == before
     except Exception:      # pragma: no cover - never let a probe break a save
         return False
     finally:
@@ -348,6 +355,23 @@ def _burial_confirmed(source: Path, page_no: int, rects: list[fitz.Rect]) -> boo
 # Cap on individual burial probes per page, so a pathological file cannot turn one
 # request into thousands of renders. Each probe only renders one span's area.
 MAX_BURIAL_PROBES = 60
+
+# Burial verdicts, keyed by (doc_id, page). `original.pdf` never changes once
+# uploaded, so a verdict is good for the life of the document. Without this,
+# every /api/hidden re-ran the probes: measured at 1.5-2.2 s per call on a 3.4 MB
+# scan, paid again on every page revisit, which is most of what made paging feel
+# like the page was flickering.
+_BURIED_CACHE: dict[tuple[str, int], frozenset[int]] = {}
+
+
+def _confirm_buried_cached(doc_id: str, page: fitz.Page, source: Path,
+                           page_no: int) -> frozenset[int]:
+    key = (doc_id, page_no)
+    cached = _BURIED_CACHE.get(key)
+    if cached is None:
+        cached = frozenset(_confirm_buried(page, source, page_no))
+        _BURIED_CACHE[key] = cached
+    return cached
 
 
 def _confirm_buried(page: fitz.Page, source: Path, page_no: int) -> set[int]:
@@ -419,9 +443,76 @@ def _visible_boxes(page: fitz.Page, buried: set[int] = frozenset()) -> list[fitz
     return boxes
 
 
+def _blanket_bands(sel: fitz.Rect, keep_out: list[fitz.Rect]) -> list[fitz.Rect]:
+    """
+    Split `sel` into horizontal bands that avoid every rect in `keep_out`.
+
+    The blanket rectangle is the only way to reach text `get_texttrace()` cannot
+    see (clip-only render mode 7), so it cannot simply be dropped when a nearby
+    hidden line must be spared. Bands keep the reach while carving out the rows
+    those spared lines occupy, which is enough for the line-shaped layers OCR
+    tools produce.
+    """
+    bands = [(sel.y0, sel.y1)]
+    for rect in keep_out:
+        # Redaction is boundary-inclusive and matches the glyph's em box, not the
+        # tight bbox get_texttrace() reports, so a band ending exactly at a
+        # line's top edge still deletes it. Measured: sparing a 12pt line needs
+        # ~2pt of clearance and a 48pt line needs ~12pt, hence a proportional
+        # pad rather than a constant.
+        pad = max(2.0, rect.height * 0.25)
+        lo, hi = max(sel.y0, rect.y0 - pad), min(sel.y1, rect.y1 + pad)
+        if hi <= lo:
+            continue
+        split: list[tuple[float, float]] = []
+        for a, b in bands:
+            if hi <= a or lo >= b:
+                split.append((a, b))
+                continue
+            if a < lo:
+                split.append((a, lo))
+            if hi < b:
+                split.append((hi, b))
+        bands = split
+    return [fitz.Rect(sel.x0, a, sel.x1, b) for a, b in bands if b - a > 0.5]
+
+
+def _chars_in_rects(page: fitz.Page, rects: list[fitz.Rect]) -> int:
+    """Count non-space glyphs meeting `rects`, each glyph once however many overlap."""
+    if not rects:
+        return 0
+    total = 0
+    for span in page.get_texttrace():
+        for ch in span["chars"]:
+            if chr(ch[0]).isspace():
+                continue
+            box = fitz.Rect(ch[3])
+            if any(box.intersects(r) for r in rects):
+                total += 1
+    return total
+
+
+def _hidden_text_in(page: fitz.Page, rects: list[fitz.Rect],
+                    buried: set[int] = frozenset()) -> str:
+    """Hidden text meeting `rects`, i.e. exactly what a save would delete."""
+    if not rects:
+        return ""
+    out: list[str] = []
+    for span in page.get_texttrace():
+        if not (_is_hidden(span) or span.get("seqno") in buried):
+            continue
+        chars = "".join(
+            chr(ch[0]) for ch in span["chars"]
+            if any(fitz.Rect(ch[3]).intersects(r) for r in rects)
+        )
+        if chars.strip():
+            out.append(chars.strip())
+    return " ".join(out).strip()
+
+
 def _clearable_rects(page: fitz.Page, text_rect: fitz.Rect,
                      visible: list[fitz.Rect],
-                     buried: set[int] = frozenset()) -> tuple[list[fitz.Rect], int]:
+                     buried: set[int] = frozenset()) -> tuple[list[fitz.Rect], set[int]]:
     """
     Decide what may be deleted for a selection, returning `(rects, protected)`.
 
@@ -436,18 +527,26 @@ def _clearable_rects(page: fitz.Page, text_rect: fitz.Rect,
       line that is at least `COVERAGE_TO_DELETE` inside the selection is cleared
       whole, including the part sticking out, so no fragments are left behind.
 
+      A line *below* that threshold has to be spared, and sparing it means
+      keeping it out of the blanket rectangle too: `apply_redactions()` drops
+      every glyph its rectangles touch, so a blanket rect covering the whole
+      selection would delete a barely clipped neighbour regardless of the
+      threshold check. `_blanket_bands()` carves those rows out.
+
     * **Visible text present.** The blanket rectangle would take ink with it, so
       only hidden lines qualify, each checked against the visible glyph boxes.
-      Lines that overlap ink are skipped and counted as protected.
+      Lines that overlap ink are skipped and reported as protected.
+
+    `protected` is a set of span `seqno`s rather than a count, so a caller
+    handling several boxes on one page can union them instead of counting the
+    same spared line once per box.
     """
     hidden_spans = [s for s in page.get_texttrace()
                     if _is_hidden(s) or s.get("seqno") in buried]
     rects: list[fitz.Rect] = []
-    protected = 0
+    protected: set[int] = set()
+    keep_out: list[fitz.Rect] = []
     ink_here = [v for v in visible if v.intersects(text_rect)]
-
-    if not ink_here:
-        rects.append(fitz.Rect(text_rect))
 
     for span in hidden_spans:
         bbox = fitz.Rect(span["bbox"])
@@ -457,20 +556,47 @@ def _clearable_rects(page: fitz.Page, text_rect: fitz.Rect,
         if overlap.is_empty or bbox.get_area() <= 0:
             continue
         if overlap.get_area() / bbox.get_area() < COVERAGE_TO_DELETE:
+            keep_out.append(bbox)
             continue
         if any(bbox.intersects(v) for v in visible):
-            protected += 1
+            seq = span.get("seqno")
+            protected.add(seq if seq is not None else id(span))
+            keep_out.append(bbox)
             continue
         rects.append(bbox)
+
+    if not ink_here:
+        rects.extend(_blanket_bands(text_rect, keep_out))
 
     return rects, protected
 
 
-def _restore_page(doc: fitz.Document, original: fitz.Document, page_no: int) -> fitz.Page:
-    """Put a page back exactly as it was, used when clearing changed the render."""
-    doc.delete_page(page_no)
-    doc.insert_pdf(original, from_page=page_no, to_page=page_no, start_at=page_no)
-    return doc[page_no]
+def _clear_is_invisible(source: Path, page_no: int, rects: list[fitz.Rect]) -> bool:
+    """
+    Would clearing `rects` change how the page looks? Decided on a copy.
+
+    The appearance guard runs *before* the live document is touched, so a
+    deletion that would take visible ink with it is simply never applied. The
+    alternative, clearing first and undoing it afterwards, cannot be done
+    cleanly: `apply_redactions()` rewrites the page's resources as well as its
+    content stream, so putting the old stream back leaves it pointing at
+    XObjects that no longer exist ("cannot find XObject resource 'fzImg0'"),
+    and replacing the whole page (delete_page + insert_pdf) makes a new page
+    object, which resolves outline destinations to -1, renames form fields, and
+    invalidates the caller's own page handle mid-loop.
+    """
+    if not rects:
+        return True
+    probe = fitz.open(source)
+    try:
+        page = probe[page_no]
+        before = page.get_pixmap(dpi=VERIFY_DPI).tobytes("png")
+        _clear_invisible_text(page, rects)
+        return page.get_pixmap(dpi=VERIFY_DPI).tobytes("png") == before
+    except Exception:      # pragma: no cover - a probe must never break a save
+        return False
+    finally:
+        probe.close()
 
 
 def _clear_invisible_text(page: fitz.Page, rects: list[fitz.Rect]) -> None:
@@ -584,9 +710,21 @@ def _sanitize(text: str) -> tuple[str, list[str]]:
     return "".join(out), sorted(set(dropped))
 
 
-def _insert_invisible_text(page: fitz.Page, rect: fitz.Rect, text: str) -> int:
+def _insert_invisible_text(page: fitz.Page, view_rect: fitz.Rect, text: str) -> int:
     """
-    Lay `text` invisibly inside `rect`, one PDF text line per input line.
+    Lay `text` invisibly inside `view_rect`, one PDF text line per input line.
+
+    `view_rect` is in *view* space, the box the user actually drew on the render.
+    That is deliberate: layout has to happen in the space the user sees, because
+    a rotated page swaps the box's width and height in unrotated space. Feeding
+    the derotated rect in here instead turns a wide one-line box on a /Rotate 90
+    page into a tall narrow one, and the line is then fitted to the wrong
+    dimension - measured as a 1.4 x 20 pt sliver at fontsize 1 where 692 x 20 pt
+    was drawn.
+
+    Only the per-line anchor crosses into unrotated space, and `rotate=` carries
+    the page's rotation so glyph advance follows the text the user was reading
+    rather than the unrotated +x axis.
 
     Font size is chosen so each line fits both the line's vertical slot and the
     box width, so selection highlights line up with what is on the page.
@@ -596,22 +734,24 @@ def _insert_invisible_text(page: fitz.Page, rect: fitz.Rect, text: str) -> int:
     if not lines:
         return 0
 
-    line_h = rect.height / len(lines)
+    line_h = view_rect.height / len(lines)
     written = 0
     for i, line in enumerate(lines):
         width_at_1pt = fitz.get_text_length(line, fontname=FONT_NAME, fontsize=1)
         size = line_h * 0.9
         if width_at_1pt > 0:
-            size = min(size, rect.width / width_at_1pt)
+            size = min(size, view_rect.width / width_at_1pt)
         size = max(1.0, min(size, 200.0))
-        baseline = rect.y0 + line_h * i + line_h * 0.8
+        baseline = fitz.Point(view_rect.x0,
+                              view_rect.y0 + line_h * i + line_h * 0.8)
         page.insert_text(
-            fitz.Point(rect.x0, baseline),
+            baseline * page.derotation_matrix,
             line,
             fontname=FONT_NAME,
             fontsize=size,
             render_mode=INVISIBLE,
             color=(0, 0, 0),
+            rotate=page.rotation,
         )
         written += 1
     return written
@@ -634,6 +774,19 @@ def _no_cache(resp):
         resp.headers["Cache-Control"] = "no-store, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
     return resp
+
+
+@app.errorhandler(HTTPException)
+def _json_error(exc: HTTPException):
+    """
+    Answer every abort() with JSON instead of Werkzeug's HTML error page.
+
+    The frontend's api() only parses a body whose content type is JSON and then
+    reads `description`, so without this every abort() reached the user as the
+    bare status line: a password-protected upload said "BAD REQUEST" rather than
+    saying the PDF is encrypted.
+    """
+    return jsonify({"error": exc.name, "description": exc.description}), exc.code
 
 
 @app.get("/")
@@ -726,7 +879,7 @@ def hidden_spans(doc_id: str, page_no: int):
             abort(404, "page out of range")
         page = doc[page_no]
         pr = page.rect
-        buried = _confirm_buried(page, source, page_no)
+        buried = _confirm_buried_cached(doc_id, page, source, page_no)
         spans = []
         traced = 0
         for span in page.get_texttrace():
@@ -745,6 +898,11 @@ def hidden_spans(doc_id: str, page_no: int):
             view = (box * page.rotation_matrix).normalize()
             spans.append({
                 "text": text,
+                # Identity, so the UI can tell two spans holding the same string
+                # apart. Keying on the text alone made the second "Total" on a
+                # page unclickable, and a correction typed after clicking it was
+                # written at the first one's coordinates.
+                "id": span.get("seqno"),
                 "mode": span["type"],
                 "kind": kind,
                 "rect": {
@@ -800,9 +958,21 @@ def ocr():
         # get_pixmap() clips in view space - the same space the browser drew in.
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
         raw = Image.open(io.BytesIO(pix.tobytes("png")))
-        buried = _confirm_buried(page, _original_pdf(doc_id), page_no)
-        visible_text, invisible_text = _region_text(
-            page, _text_rect(page, rect), buried)
+        buried = _confirm_buried_cached(
+            doc_id, page, _original_pdf(doc_id), page_no)
+        text_rect = _text_rect(page, rect)
+        visible_text, invisible_text = _region_text(page, text_rect, buried)
+        # What the UI offers to delete has to be what a save would actually
+        # delete. `_region_text` qualifies a span on a bare intersection, while
+        # the save applies COVERAGE_TO_DELETE and skips anything overlapping
+        # ink, so reporting the former promised deletions that never happened.
+        planned, _ = _clearable_rects(
+            page, text_rect, _visible_boxes(page, buried), buried)
+        clearable_text = _hidden_text_in(page, planned, buried)
+        kept_text = " ".join(
+            part for part in invisible_text.split()
+            if part not in clearable_text.split()
+        ).strip()
     finally:
         doc.close()
 
@@ -823,7 +993,8 @@ def ocr():
 
     return jsonify({
         "text": text,
-        "existing_invisible_text": invisible_text,
+        "existing_invisible_text": clearable_text,
+        "existing_invisible_kept": kept_text,
         "existing_visible_text": visible_text,
         "crop_size": [prepped.width, prepped.height],
         "preview": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
@@ -849,7 +1020,6 @@ def save():
 
     source = _original_pdf(doc_id)
     doc = fitz.open(source)
-    original = fitz.open(source)   # pristine reference for the appearance guard
     applied = 0
     cleared_only = 0
     lines_written = 0
@@ -861,7 +1031,7 @@ def save():
         # Group by page so each page's redactions can be applied in one pass
         # before any new text is written: apply_redactions() would otherwise
         # strip the very text just inserted.
-        by_page: dict[int, list[tuple[fitz.Rect, str, bool]]] = {}
+        by_page: dict[int, list[tuple[fitz.Rect, fitz.Rect, str, bool]]] = {}
         for box in boxes:
             text = (box.get("text") or "").strip()
             # A box with no text is only meaningful when it was explicitly marked
@@ -874,11 +1044,13 @@ def save():
             if not 0 <= page_no < doc.page_count:
                 continue
             page = doc[page_no]
-            # The browser draws on the rendered (view) image; every text
-            # operation below needs unrotated coordinates instead.
-            rect = _text_rect(page, _rect_from_norm(page, box.get("rect") or {}))
+            # The browser draws on the rendered (view) image. Deletion and text
+            # lookups need unrotated coordinates; insertion needs the view rect
+            # itself, so both are carried.
+            view_rect = _rect_from_norm(page, box.get("rect") or {})
+            rect = _text_rect(page, view_rect)
             replace = True if delete_only else bool(box.get("replace", default_replace))
-            by_page.setdefault(page_no, []).append((rect, text, replace))
+            by_page.setdefault(page_no, []).append((rect, view_rect, text, replace))
 
         if not by_page:
             abort(400, "every box was empty")
@@ -889,48 +1061,48 @@ def save():
             # Only hidden text is ever deleted, and the result is checked against
             # the page's own render before it is accepted. Text buried under an
             # image counts as hidden once proven so by experiment.
-            buried = _confirm_buried(page, source, page_no) if any(
-                replace for _, _, replace in items) else frozenset()
+            buried = _confirm_buried_cached(doc_id, page, source, page_no) if any(
+                replace for _, _, _, replace in items) else frozenset()
             visible = _visible_boxes(page, buried)
             to_clear: list[fitz.Rect] = []
-            for rect, _, replace in items:
+            protected_spans: set[int] = set()
+            for rect, _, _, replace in items:
                 if not replace:
                     continue
                 rects, protected = _clearable_rects(page, rect, visible, buried)
                 to_clear.extend(rects)
-                lines_protected += protected
+                # Union rather than sum: overlapping boxes on one page keep
+                # meeting the same spared line, and counting it once per box
+                # made the banner claim three kept lines on a page with one.
+                protected_spans |= protected
+            lines_protected += len(protected_spans)
 
             if to_clear:
-                before_render = page.get_pixmap(dpi=VERIFY_DPI).tobytes("png")
-                before_text = sum(len(page.get_text("text", clip=r).strip())
-                                  for r, _, replace in items if replace)
-
-                _clear_invisible_text(page, to_clear)
-
-                if page.get_pixmap(dpi=VERIFY_DPI).tobytes("png") != before_render:
-                    # Something visible went with it. Refuse the deletion outright
-                    # rather than hand back a PDF that lost words: the page goes
-                    # back to its original state and the correction is still added.
-                    page = _restore_page(doc, original, page_no)
-                    appearance_guard += 1
+                if _clear_is_invisible(source, page_no, to_clear):
+                    # Counted over the rects actually handed to apply_redactions,
+                    # so a span cleared whole is counted whole, and two
+                    # overlapping boxes do not count the same glyph twice.
+                    before_text = _chars_in_rects(page, to_clear)
+                    _clear_invisible_text(page, to_clear)
+                    chars_removed += max(
+                        0, before_text - _chars_in_rects(page, to_clear))
                 else:
-                    after_text = sum(len(page.get_text("text", clip=r).strip())
-                                     for r, _, replace in items if replace)
-                    chars_removed += max(0, before_text - after_text)
+                    # Something visible would have gone with it, so the deletion
+                    # is refused outright and the correction is still added.
+                    appearance_guard += 1
 
-            for rect, text, _ in items:
+            for _, view_rect, text, _ in items:
                 if not text:
                     cleared_only += 1      # a delete-only box: nothing to write
                     continue
                 clean, dropped = _sanitize(text)
                 dropped_chars.update(dropped)
-                lines_written += _insert_invisible_text(page, rect, clean)
+                lines_written += _insert_invisible_text(page, view_rect, clean)
                 applied += 1
 
         doc.save(str(out_path), garbage=3, deflate=True)
     finally:
         doc.close()
-        original.close()
 
     (ddir / "boxes.json").write_text(
         json.dumps({"filename": meta["filename"], "boxes": boxes}, indent=2),
