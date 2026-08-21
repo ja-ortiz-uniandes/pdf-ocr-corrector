@@ -324,8 +324,19 @@ it can be restored on a new device. Adding a second device's key: generate a key
 (`git-age keys generate`), then from a device that already has access run `git-age add-recipient <new
 public key>`, which appends it to `.agerecipients`, re-encrypts every tracked file, and commits.
 
-`git config --global diff.age.textconv cat` makes `git diff` show plaintext diffs instead of ciphertext
-noise (already set on this machine).
+Per-machine setup, all four steps, none of them derivable from the repo: install `git-age`
+(`winget install prskr.git-age` on Windows, which appends its own package directory to the user PATH, so
+existing shells need a restart before `git-age` resolves); run `git-age install` to register the filters
+globally; restore the private key from Bitwarden to `%LOCALAPPDATA%\git-age\keys.txt`; and run
+`git config --global diff.age.textconv cat` so `git diff` shows plaintext instead of ciphertext noise.
+Check with `git config --global --get-regexp '(filter|diff|merge)\.age'`, which must list
+`filter.age.clean`, `filter.age.smudge`, `filter.age.required` and `diff.age.textconv`.
+
+Until all four are done the failure looks like two different things: with no filter registered a checkout
+leaves *ciphertext* in the working tree (git treats an undefined filter as pass-through, silently), while
+with the filter registered but no key present every `git status`, `git add` or checkout touching
+`TODO.md` dies with `no identities specified`, since `filter.age.required` is true. The second failure
+is the safe one, and is why `required` is set.
 
 **Swapping `.agerecipients` alone does not re-encrypt anything already committed.** `git-age`'s `clean`
 filter decrypts HEAD's blob, compares it to the working-tree plaintext, and if they match byte-for-byte
