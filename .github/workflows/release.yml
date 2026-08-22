@@ -43,8 +43,9 @@ jobs:
           Tesseract themselves), then opens the app in your browser.
 
           EOF
+          gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --notes-file /tmp/how-to-run.md --generate-notes --clobber
+            --notes-file /tmp/how-to-run.md --generate-notes
 
   build-windows:
     needs: release
